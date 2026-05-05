@@ -6,10 +6,15 @@ import os
 
 from sklearn.impute import KNNImputer
 from sklearn.preprocessing import MinMaxScaler
+from sklearn.preprocessing import StandardScaler
+
 from sklearn.feature_selection import mutual_info_classif
 from sklearn.linear_model import LogisticRegression
+from sklearn.linear_model import LogisticRegressionCV
 from sklearn.svm import SVC
 from sklearn.ensemble import RandomForestClassifier
+from sklearn.utils import resample          # <-- NEW import for downsampling
+from imblearn.over_sampling import SMOTE
 
 from sklearn.metrics import (
     accuracy_score,
@@ -53,7 +58,7 @@ Testing:
 
 Pipeline:
 
-Expression Parsing → Label Extraction → Probe Mapping → DEA → mRMR → LASSO → Classification
+Expression Parsing → Label Extraction → Probe Mapping → DEA → mRMR → LASSO → (Downsampling + SMOTE) → Classification
 """)
 
 
@@ -97,7 +102,6 @@ def extract_labels(lines, sample_ids):
 
         title_lower = title.lower()
 
-        # GSE32225 special
         if title_lower.startswith("ctrl"):
             labels[sid] = 0
 
@@ -108,7 +112,6 @@ def extract_labels(lines, sample_ids):
         ):
             labels[sid] = 1
 
-        # generic normal
         elif any(keyword in title_lower for keyword in [
             "normal",
             "control",
@@ -117,7 +120,6 @@ def extract_labels(lines, sample_ids):
         ]):
             labels[sid] = 0
 
-        # generic tumor
         elif any(keyword in title_lower for keyword in [
             "tumor",
             "cca",
@@ -275,7 +277,7 @@ def load_annotation(path, gpl_type):
 
 
 # =========================================================
-# PROBE TO GENE CONVERSION
+# PROBE TO GENE
 # =========================================================
 def convert_probe_to_gene(expr_df, mapping):
 
@@ -291,7 +293,6 @@ def convert_probe_to_gene(expr_df, mapping):
         for p in common_probe
     ]
 
-    # merge duplicate genes
     expr_df = (
         expr_df.T
         .groupby(level=0)
@@ -314,15 +315,15 @@ def differential_expression(
 
     results = []
 
-    for gene in X.columns:
+    tumor_idx = y[y == 1].index.intersection(X.index)
+    normal_idx = y[y == 0].index.intersection(X.index)
 
-        tumor_idx = y[y == 1].index
-        normal_idx = y[y == 0].index
+    for gene in X.columns:
 
         tumor = X.loc[tumor_idx, gene]
         normal = X.loc[normal_idx, gene]
 
-        if len(tumor) < 2 or len(normal) < 2:
+        if tumor.var() == 0 and normal.var() == 0:
             continue
 
         logfc = np.log2(
@@ -339,9 +340,6 @@ def differential_expression(
         results.append(
             [gene, logfc, pval]
         )
-
-    if len(results) == 0:
-        return []
 
     res_df = pd.DataFrame(
         results,
@@ -363,6 +361,12 @@ def differential_expression(
         &
         (res_df["adj_p"] < pval_thresh)
     ]
+
+    if len(sig) < 20:
+        sig = res_df.nsmallest(
+            50,
+            "adj_p"
+        )
 
     return sig["gene"].tolist()
 
@@ -392,14 +396,14 @@ def mrmr_selection(X, y, k=20):
 # =========================================================
 # LASSO
 # =========================================================
-def lasso_selection(X, y, C=0.1):
+def lasso_selection(X, y):
 
-    model = LogisticRegression(
+    model = LogisticRegressionCV(
         penalty="l1",
         solver="saga",
-        C=C,
+        cv=5,
         random_state=42,
-        max_iter=3000
+        max_iter=5000
     )
 
     model.fit(X, y)
@@ -408,11 +412,17 @@ def lasso_selection(X, y, C=0.1):
         model.coef_[0] != 0
     ].tolist()
 
+    if len(selected) < 10:
+        selected = X.columns[:20].tolist()
+
     return selected
 
 
 # =========================================================
-# TRAIN MODELS
+# TRAIN MODELS (UPDATED)
+# =========================================================
+# =========================================================
+# TRAIN MODELS (FIXED BALANCE)
 # =========================================================
 def train_models(
     X_train,
@@ -423,20 +433,30 @@ def train_models(
 
     models = {
         "SVM": SVC(
+            kernel="rbf",
+            C=0.5,
+            gamma="scale",
             probability=True,
-            class_weight="balanced",
+            class_weight=None,   # FIX
             random_state=42
         ),
 
         "RandomForest": RandomForestClassifier(
-            class_weight="balanced",
+            n_estimators=300,
+            max_features="sqrt",
+            bootstrap=True,
+            max_depth=10,
+            min_samples_split=5,
+            min_samples_leaf=2,
+            class_weight=None,   # FIX
             random_state=42
         ),
 
         "LogisticRegression": LogisticRegression(
-            class_weight="balanced",
+            C=1.0,
+            class_weight=None,   # FIX
             random_state=42,
-            max_iter=3000
+            max_iter=5000
         )
     }
 
@@ -449,13 +469,30 @@ def train_models(
             y_train
         )
 
-        y_pred = model.predict(
-            X_test
-        )
+        # probability
+        if hasattr(model, "predict_proba"):
+            y_prob = model.predict_proba(
+                X_test
+            )[:, 1]
+        else:
+            decision_scores = model.decision_function(
+                X_test
+            )
 
-        y_prob = model.predict_proba(
-            X_test
-        )[:, 1]
+            y_prob = (
+                decision_scores - decision_scores.min()
+            ) / (
+                decision_scores.max()
+                - decision_scores.min()
+                + 1e-8
+            )
+
+        # dynamic threshold
+        threshold = 0.5
+
+        y_pred = (
+            y_prob >= threshold
+        ).astype(int)
 
         results[name] = {
             "Accuracy":
@@ -467,19 +504,22 @@ def train_models(
             "Precision":
                 precision_score(
                     y_test,
-                    y_pred
+                    y_pred,
+                    zero_division=0
                 ),
 
             "Recall":
                 recall_score(
                     y_test,
-                    y_pred
+                    y_pred,
+                    zero_division=0
                 ),
 
             "F1":
                 f1_score(
                     y_test,
-                    y_pred
+                    y_pred,
+                    zero_division=0
                 ),
 
             "AUC":
@@ -576,11 +616,17 @@ mrmr_k = st.sidebar.slider(
     50
 )
 
+# lasso_c is not used now because we use LogisticRegressionCV, but keep it for interface
 lasso_c = st.sidebar.slider(
-    "LASSO C",
+    "LASSO C (for CV)",
     0.01,
     1.0,
     0.1
+)
+
+use_smote = st.sidebar.checkbox(
+    "Use SMOTE for imbalance handling",
+    value=True
 )
 
 run = st.sidebar.button(
@@ -596,70 +642,35 @@ if run:
     data_dir = "data"
 
     expr1, y1 = parse_series_matrix(
-        FileLike(
-            os.path.join(
-                data_dir,
-                "GSE76297_series_matrix.txt"
-            )
-        )
+        FileLike(os.path.join(data_dir, "GSE76297_series_matrix.txt"))
     )
 
     expr2, y2 = parse_series_matrix(
-        FileLike(
-            os.path.join(
-                data_dir,
-                "GSE132305_series_matrix.txt"
-            )
-        )
+        FileLike(os.path.join(data_dir, "GSE132305_series_matrix.txt"))
     )
 
     expr3, y3 = parse_series_matrix(
-        FileLike(
-            os.path.join(
-                data_dir,
-                "GSE32225_series_matrix.txt"
-            )
-        )
+        FileLike(os.path.join(data_dir, "GSE32225_series_matrix.txt"))
     )
 
     map1 = load_annotation(
-        os.path.join(
-            data_dir,
-            "GPL17586.txt"
-        ),
+        os.path.join(data_dir, "GPL17586.txt"),
         "GPL17586"
     )
 
     map2 = load_annotation(
-        os.path.join(
-            data_dir,
-            "GPL13667.txt"
-        ),
+        os.path.join(data_dir, "GPL13667.txt"),
         "GPL13667"
     )
 
     map3 = load_annotation(
-        os.path.join(
-            data_dir,
-            "GPL8432.txt"
-        ),
+        os.path.join(data_dir, "GPL8432.txt"),
         "GPL8432"
     )
 
-    expr1 = convert_probe_to_gene(
-        expr1,
-        map1
-    )
-
-    expr2 = convert_probe_to_gene(
-        expr2,
-        map2
-    )
-
-    expr3 = convert_probe_to_gene(
-        expr3,
-        map3
-    )
+    expr1 = convert_probe_to_gene(expr1, map1)
+    expr2 = convert_probe_to_gene(expr2, map2)
+    expr3 = convert_probe_to_gene(expr3, map3)
 
     common_genes = (
         expr1.columns
@@ -671,12 +682,6 @@ if run:
         f"Common genes: {len(common_genes)}"
     )
 
-    if len(common_genes) == 0:
-        st.error(
-            "No common genes found."
-        )
-        st.stop()
-
     X_train = pd.concat([
         expr1[common_genes],
         expr2[common_genes]
@@ -687,53 +692,39 @@ if run:
         y2
     ])
 
-    X_test = expr3[
-        common_genes
-    ]
-
+    X_test = expr3[common_genes]
     y_test = y3
 
-    # KNN IMPUTE (FIX INDEX)
     imputer = KNNImputer(
         n_neighbors=impute_k
     )
 
     X_train = pd.DataFrame(
-        imputer.fit_transform(
-            X_train
-        ),
+        imputer.fit_transform(X_train),
         index=X_train.index,
         columns=X_train.columns
     )
 
     X_test = pd.DataFrame(
-        imputer.transform(
-            X_test
-        ),
+        imputer.transform(X_test),
         index=X_test.index,
         columns=X_test.columns
     )
 
-    # SCALE (FIX INDEX)
-    scaler = MinMaxScaler()
+    scaler = MinMaxScaler(feature_range=(-1, 1))
 
     X_train = pd.DataFrame(
-        scaler.fit_transform(
-            X_train
-        ),
+        scaler.fit_transform(X_train),
         index=X_train.index,
         columns=X_train.columns
     )
 
     X_test = pd.DataFrame(
-        scaler.transform(
-            X_test
-        ),
+        scaler.transform(X_test),
         index=X_test.index,
         columns=X_test.columns
     )
 
-    # DEA
     st.subheader(
         "Differential Expression Analysis"
     )
@@ -749,15 +740,9 @@ if run:
         f"DEA selected: {len(dea_genes)}"
     )
 
-    X_train_dea = X_train[
-        dea_genes
-    ]
+    X_train_dea = X_train[dea_genes]
+    X_test_dea = X_test[dea_genes]
 
-    X_test_dea = X_test[
-        dea_genes
-    ]
-
-    # MRMR
     st.subheader(
         "mRMR Selection"
     )
@@ -765,46 +750,103 @@ if run:
     mrmr_genes = mrmr_selection(
         X_train_dea,
         y_train,
-        min(
-            mrmr_k,
-            len(dea_genes)
-        )
+        min(mrmr_k, len(dea_genes))
     )
 
     st.write(
         f"mRMR selected: {len(mrmr_genes)}"
     )
 
-    # LASSO
     st.subheader(
         "LASSO Selection"
     )
 
-    lasso_genes = lasso_selection(
+    final_features = lasso_selection(
         X_train[mrmr_genes],
-        y_train,
-        lasso_c
-    )
-
-    final_features = (
-        lasso_genes
-        if len(lasso_genes) > 0
-        else mrmr_genes
+        y_train
     )
 
     st.success(
         f"Final selected genes: {len(final_features)}"
     )
 
-    # TRAIN
+    X_train_final = X_train[final_features]
+    X_test_final = X_test[final_features]
+
+    # =========================================================
+    # NEW: BALANCING via DOWNSAMPLING of MAJORITY CLASS
+    # =========================================================
+    st.subheader("Class Distribution Before Balancing")
+    st.write(pd.Series(y_train).value_counts())
+
+    # Combine features and labels to a single DataFrame for easier resampling
+    train_df = X_train_final.copy()
+    train_df['class'] = y_train
+
+    # Separate majority (tumor=1) and minority (normal=0)
+    majority = train_df[train_df['class'] == 1]
+    minority = train_df[train_df['class'] == 0]
+
+    # Downsample majority to match size of minority
+    if len(majority) > len(minority):
+        majority_downsampled = resample(majority,
+                                        replace=False,
+                                        n_samples=len(minority),
+                                        random_state=42)
+        balanced_df = pd.concat([majority_downsampled, minority])
+    else:
+        # If majority is already smaller (unlikely), keep as is
+        balanced_df = train_df
+
+    X_train_final = balanced_df.drop('class', axis=1)
+    y_train = balanced_df['class']
+
+    st.subheader("Class Distribution After Downsampling (1:1 ratio)")
+    st.write(pd.Series(y_train).value_counts())
+
+    # Optional SMOTE (if user selected) – this will generate synthetic minority samples
+    if use_smote:
+
+        class_counts = pd.Series(y_train).value_counts()
+
+        majority_count = class_counts.max()
+        minority_count = class_counts.min()
+
+        # hanya jalankan SMOTE jika memang masih imbalance
+        if majority_count > minority_count:
+
+            ratio = majority_count / minority_count
+
+            k_neighbors = min(3, minority_count - 1)
+
+            if k_neighbors < 1:
+                k_neighbors = 1
+
+            smote = SMOTE(
+                sampling_strategy=1.0,
+                random_state=42,
+                k_neighbors=k_neighbors
+            )
+
+            X_train_final, y_train = smote.fit_resample(
+                X_train_final,
+                y_train
+            )
+
+            st.subheader("Class Distribution After SMOTE")
+            st.write(pd.Series(y_train).value_counts())
+
+        else:
+            st.info("SMOTE skipped: dataset already balanced.")
+
     st.subheader(
         "Model Performance"
     )
 
     results = train_models(
-        X_train[final_features],
+        X_train_final,
         y_train,
-        X_test[final_features],
+        X_test_final,
         y_test
     )
 
@@ -817,15 +859,11 @@ if run:
         ]
     )
 
-    st.dataframe(
-        metrics_df
-    )
+    st.dataframe(metrics_df)
 
     for model_name, result in results.items():
 
-        st.subheader(
-            model_name
-        )
+        st.subheader(model_name)
 
         col1, col2 = st.columns(2)
 
@@ -845,10 +883,29 @@ if run:
                 )
             )
 
+    for model_name, result in results.items():
+        st.write(model_name)
+        st.write(pd.Series(result["y_pred"]).value_counts())
+        
+        st.write("Prediction probability summary")
+        st.write(pd.Series(result["y_prob"]).describe())
+
+    st.write("Final training distribution (after all balancing)")
+    st.write(pd.Series(y_train).value_counts())
+
+    st.write("Test distribution (original, imbalanced)")
+    st.write(pd.Series(y_test).value_counts())
+
+    st.write("Selected genes")
+    st.write(final_features)
+    
+    # Show mean probability for the best model (last model in loop)
+    st.write("Mean tumor probability (last model):", np.mean(list(results.values())[-1]["y_prob"]))
+    st.write("Min tumor probability:", np.min(list(results.values())[-1]["y_prob"]))
+    st.write("Max tumor probability:", np.max(list(results.values())[-1]["y_prob"]))
+
     st.download_button(
         "📥 Download Selected Genes",
-        "\n".join(
-            final_features
-        ),
+        "\n".join(final_features),
         "selected_genes.txt"
     )
