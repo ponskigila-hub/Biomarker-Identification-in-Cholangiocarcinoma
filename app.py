@@ -7,6 +7,7 @@ import os
 from sklearn.impute import KNNImputer
 from sklearn.preprocessing import MinMaxScaler
 from sklearn.preprocessing import StandardScaler
+from sklearn.feature_selection import VarianceThreshold
 
 from sklearn.feature_selection import mutual_info_classif
 from sklearn.linear_model import LogisticRegression
@@ -100,9 +101,25 @@ def extract_labels(lines, sample_ids):
 
     for sid, title in zip(sample_ids, sample_titles):
 
-        title_lower = title.lower()
+        title_lower = title.lower().strip()
 
-        if title_lower.startswith("ctrl"):
+        # =========================================
+        # GSE132305 FIX
+        # BD = benign disease / non-tumor
+        # eCCA = tumor
+        # =========================================
+        if title_lower.endswith("_bd"):
+            labels[sid] = 0
+
+        elif title_lower.endswith("_ecca"):
+            labels[sid] = 1
+
+        # =========================================
+        # GSE76297 FIX
+        # ctrl = normal
+        # ccbcn / ccm / ccny = tumor
+        # =========================================
+        elif title_lower.startswith("ctrl"):
             labels[sid] = 0
 
         elif (
@@ -112,11 +129,15 @@ def extract_labels(lines, sample_ids):
         ):
             labels[sid] = 1
 
+        # =========================================
+        # Generic keywords
+        # =========================================
         elif any(keyword in title_lower for keyword in [
             "normal",
             "control",
             "non-tumor",
-            "adjacent normal"
+            "adjacent normal",
+            "benign"
         ]):
             labels[sid] = 0
 
@@ -130,6 +151,11 @@ def extract_labels(lines, sample_ids):
 
         else:
             labels[sid] = -1
+
+    # debug summary
+    label_counts = pd.Series(labels).value_counts()
+    st.write("Detected labels summary:")
+    st.write(label_counts)
 
     return labels
 
@@ -315,8 +341,8 @@ def differential_expression(
 
     results = []
 
-    tumor_idx = y[y == 1].index.intersection(X.index)
-    normal_idx = y[y == 0].index.intersection(X.index)
+    tumor_idx = y[y == 1].index
+    normal_idx = y[y == 0].index
 
     for gene in X.columns:
 
@@ -331,22 +357,34 @@ def differential_expression(
             (normal.mean() + 1e-8)
         )
 
-        _, pval = stats.ttest_ind(
+        t_stat, pval = stats.ttest_ind(
             tumor,
             normal,
             equal_var=False
         )
 
-        results.append(
-            [gene, logfc, pval]
+        effect_size = (
+            tumor.mean() - normal.mean()
+        ) / (
+            np.sqrt(
+                (tumor.std()**2 + normal.std()**2)/2
+            ) + 1e-8
         )
+
+        results.append([
+            gene,
+            logfc,
+            pval,
+            abs(effect_size)
+        ])
 
     res_df = pd.DataFrame(
         results,
         columns=[
             "gene",
             "logFC",
-            "pvalue"
+            "pvalue",
+            "effect_size"
         ]
     )
 
@@ -356,20 +394,42 @@ def differential_expression(
 
     res_df["adj_p"] = adj_p
 
+    score = (
+        abs(res_df["logFC"]) *
+        res_df["effect_size"] *
+        -np.log10(res_df["adj_p"] + 1e-8)
+    )
+
+    res_df["score"] = score
+
     sig = res_df[
-        (abs(res_df["logFC"]) > logfc_thresh)
-        &
         (res_df["adj_p"] < pval_thresh)
     ]
 
-    if len(sig) < 20:
-        sig = res_df.nsmallest(
-            50,
-            "adj_p"
+    if len(sig) < 50:
+        sig = res_df.nlargest(
+            200,
+            "score"
         )
 
     return sig["gene"].tolist()
 
+
+variance_filter = VarianceThreshold(
+    threshold=0.01
+)
+
+X_train_dea = pd.DataFrame(
+    variance_filter.fit_transform(X_train_dea),
+    index=X_train_dea.index,
+    columns=X_train_dea.columns[
+        variance_filter.get_support()
+    ]
+)
+
+X_test_dea = X_test_dea[
+    X_train_dea.columns
+]
 
 # =========================================================
 # MRMR
@@ -418,12 +478,6 @@ def lasso_selection(X, y):
     return selected
 
 
-# =========================================================
-# TRAIN MODELS (UPDATED)
-# =========================================================
-# =========================================================
-# TRAIN MODELS (FIXED BALANCE)
-# =========================================================
 def train_models(
     X_train,
     y_train,
@@ -433,28 +487,21 @@ def train_models(
 
     models = {
         "SVM": SVC(
-            kernel="rbf",
-            C=0.5,
-            gamma="scale",
+            kernel="linear",   # ganti dari rbf
+            C=0.1,
             probability=True,
-            class_weight=None,   # FIX
             random_state=42
         ),
 
         "RandomForest": RandomForestClassifier(
-            n_estimators=300,
-            max_features="sqrt",
-            bootstrap=True,
-            max_depth=10,
-            min_samples_split=5,
-            min_samples_leaf=2,
-            class_weight=None,   # FIX
+            n_estimators=500,
+            max_depth=5,
+            min_samples_leaf=5,
             random_state=42
         ),
 
         "LogisticRegression": LogisticRegression(
             C=1.0,
-            class_weight=None,   # FIX
             random_state=42,
             max_iter=5000
         )
@@ -464,81 +511,29 @@ def train_models(
 
     for name, model in models.items():
 
-        model.fit(
-            X_train,
-            y_train
-        )
+        model.fit(X_train, y_train)
 
-        # probability
-        if hasattr(model, "predict_proba"):
-            y_prob = model.predict_proba(
-                X_test
-            )[:, 1]
-        else:
-            decision_scores = model.decision_function(
-                X_test
-            )
+        y_prob = model.predict_proba(X_test)[:, 1]
 
-            y_prob = (
-                decision_scores - decision_scores.min()
-            ) / (
-                decision_scores.max()
-                - decision_scores.min()
-                + 1e-8
-            )
+        # threshold adaptif berdasarkan median probability
+        threshold = np.median(y_prob)
 
-        # dynamic threshold
-        threshold = 0.5
-
-        y_pred = (
-            y_prob >= threshold
-        ).astype(int)
+        y_pred = (y_prob >= threshold).astype(int)
 
         results[name] = {
-            "Accuracy":
-                accuracy_score(
-                    y_test,
-                    y_pred
-                ),
-
-            "Precision":
-                precision_score(
-                    y_test,
-                    y_pred,
-                    zero_division=0
-                ),
-
-            "Recall":
-                recall_score(
-                    y_test,
-                    y_pred,
-                    zero_division=0
-                ),
-
-            "F1":
-                f1_score(
-                    y_test,
-                    y_pred,
-                    zero_division=0
-                ),
-
-            "AUC":
-                roc_auc_score(
-                    y_test,
-                    y_prob
-                ),
-
-            "MCC":
-                matthews_corrcoef(
-                    y_test,
-                    y_pred
-                ),
-
+            "Accuracy": accuracy_score(y_test, y_pred),
+            "Precision": precision_score(y_test, y_pred, zero_division=0),
+            "Recall": recall_score(y_test, y_pred, zero_division=0),
+            "F1": f1_score(y_test, y_pred, zero_division=0),
+            "AUC": roc_auc_score(y_test, y_prob),
+            "MCC": matthews_corrcoef(y_test, y_pred),
             "y_pred": y_pred,
             "y_prob": y_prob
         }
 
     return results
+
+
 
 
 # =========================================================
@@ -903,6 +898,7 @@ if run:
     st.write("Mean tumor probability (last model):", np.mean(list(results.values())[-1]["y_prob"]))
     st.write("Min tumor probability:", np.min(list(results.values())[-1]["y_prob"]))
     st.write("Max tumor probability:", np.max(list(results.values())[-1]["y_prob"]))
+
 
     st.download_button(
         "📥 Download Selected Genes",
