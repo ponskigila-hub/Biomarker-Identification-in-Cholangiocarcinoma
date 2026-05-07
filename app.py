@@ -415,21 +415,6 @@ def differential_expression(
     return sig["gene"].tolist()
 
 
-variance_filter = VarianceThreshold(
-    threshold=0.01
-)
-
-X_train_dea = pd.DataFrame(
-    variance_filter.fit_transform(X_train_dea),
-    index=X_train_dea.index,
-    columns=X_train_dea.columns[
-        variance_filter.get_support()
-    ]
-)
-
-X_test_dea = X_test_dea[
-    X_train_dea.columns
-]
 
 # =========================================================
 # MRMR
