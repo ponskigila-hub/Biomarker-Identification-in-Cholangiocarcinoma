@@ -3,41 +3,32 @@ import pandas as pd
 import numpy as np
 import gzip
 import os
+import shap
 
+from sklearn.model_selection import cross_val_score, StratifiedKFold
+from sklearn.base import clone
 from sklearn.impute import KNNImputer
-from sklearn.preprocessing import MinMaxScaler
 from sklearn.preprocessing import StandardScaler
-from sklearn.feature_selection import VarianceThreshold
-
-from sklearn.feature_selection import mutual_info_classif
-from sklearn.linear_model import LogisticRegression
-from sklearn.linear_model import LogisticRegressionCV
+from sklearn.linear_model import LogisticRegression, LogisticRegressionCV
 from sklearn.svm import SVC
 from sklearn.ensemble import RandomForestClassifier
-from sklearn.utils import resample          # <-- NEW import for downsampling
-from imblearn.over_sampling import SMOTE
+from sklearn.decomposition import PCA
 
 from sklearn.metrics import (
-    accuracy_score,
-    precision_score,
-    recall_score,
-    f1_score,
-    roc_auc_score,
-    matthews_corrcoef,
     confusion_matrix,
-    roc_curve
+    roc_curve,
+    roc_auc_score
 )
 
 from scipy import stats
 from statsmodels.stats.multitest import fdrcorrection
+from mrmr import mrmr_classif
+from combat.pycombat import pycombat
 
 import matplotlib.pyplot as plt
 import seaborn as sns
 
 
-# =========================================================
-# PAGE CONFIG
-# =========================================================
 st.set_page_config(
     page_title="CCA Biomarker Discovery",
     layout="wide"
@@ -45,27 +36,10 @@ st.set_page_config(
 
 st.title("🔬 Hybrid Feature Selection for Cholangiocarcinoma")
 
-st.markdown("""
-### Workflow
 
-Automatically reading GEO Series Matrix files from `data/`
-
-Training:
-- GSE76297
-- GSE132305
-
-Testing:
-- GSE32225
-
-Pipeline:
-
-Expression Parsing → Label Extraction → Probe Mapping → DEA → mRMR → LASSO → (Downsampling + SMOTE) → Classification
-""")
-
-
-# =========================================================
+# =====================================================
 # FILE WRAPPER
-# =========================================================
+# =====================================================
 class FileLike:
     def __init__(self, path):
         self.path = path
@@ -80,110 +54,59 @@ class FileLike:
                 return f.read()
 
 
-# =========================================================
+# =====================================================
 # LABEL EXTRACTION
-# =========================================================
+# =====================================================
 def extract_labels(lines, sample_ids):
-
     sample_titles = []
 
     for line in lines:
         if line.startswith("!Sample_title"):
-            parts = line.strip().split("\t")[1:]
-            sample_titles = [x.strip('"') for x in parts]
+            sample_titles = [
+                x.strip('"')
+                for x in line.strip().split("\t")[1:]
+            ]
             break
-
-    if len(sample_titles) == 0:
-        st.error("No !Sample_title row found.")
-        return None
 
     labels = {}
 
     for sid, title in zip(sample_ids, sample_titles):
+        t = title.lower().strip()
 
-        title_lower = title.lower().strip()
-
-        # =========================================
-        # GSE132305 FIX
-        # BD = benign disease / non-tumor
-        # eCCA = tumor
-        # =========================================
-        if title_lower.endswith("_bd"):
+        if t.endswith("_bd"):
             labels[sid] = 0
-
-        elif title_lower.endswith("_ecca"):
+        elif t.endswith("_ecca"):
             labels[sid] = 1
-
-        # =========================================
-        # GSE76297 FIX
-        # ctrl = normal
-        # ccbcn / ccm / ccny = tumor
-        # =========================================
-        elif title_lower.startswith("ctrl"):
+        elif t.startswith("ctrl"):
             labels[sid] = 0
-
         elif (
-            title_lower.startswith("ccbcn")
-            or title_lower.startswith("ccm")
-            or title_lower.startswith("ccny")
+            t.startswith("ccbcn")
+            or t.startswith("ccm")
+            or t.startswith("ccny")
         ):
             labels[sid] = 1
-
-        # =========================================
-        # Generic keywords
-        # =========================================
-        elif any(keyword in title_lower for keyword in [
-            "normal",
-            "control",
-            "non-tumor",
-            "adjacent normal",
-            "benign"
-        ]):
+        elif any(k in t for k in ["normal", "control", "benign"]):
             labels[sid] = 0
-
-        elif any(keyword in title_lower for keyword in [
-            "tumor",
-            "cca",
-            "cholangiocarcinoma",
-            "cancer"
-        ]):
+        elif any(k in t for k in ["tumor", "cca", "cancer"]):
             labels[sid] = 1
-
         else:
             labels[sid] = -1
-
-    # debug summary
-    label_counts = pd.Series(labels).value_counts()
-    st.write("Detected labels summary:")
-    st.write(label_counts)
 
     return labels
 
 
-# =========================================================
-# PARSE SERIES MATRIX
-# =========================================================
+# =====================================================
+# PARSE MATRIX
+# =====================================================
 def parse_series_matrix(file_obj):
-
-    if file_obj.name.endswith(".gz"):
-        content = gzip.decompress(
-            file_obj.read()
-        ).decode("utf-8")
-    else:
-        content = file_obj.read().decode("utf-8")
-
+    content = file_obj.read().decode("utf-8")
     lines = content.splitlines()
 
     start_idx = None
-
     for i, line in enumerate(lines):
         if line.startswith("!series_matrix_table_begin"):
             start_idx = i + 1
             break
-
-    if start_idx is None:
-        st.error("Could not find expression table.")
-        return None, None
 
     headers = [
         x.strip('"')
@@ -191,13 +114,9 @@ def parse_series_matrix(file_obj):
     ]
 
     sample_ids = headers[1:]
-
-    st.info(f"Found {len(sample_ids)} samples")
-
     rows = []
 
     for line in lines[start_idx + 1:]:
-
         if line.startswith("!series_matrix_table_end"):
             break
 
@@ -206,10 +125,8 @@ def parse_series_matrix(file_obj):
             for x in line.split("\t")
         ]
 
-        if len(fields) != len(headers):
-            continue
-
-        rows.append(fields)
+        if len(fields) == len(headers):
+            rows.append(fields)
 
     probe_ids = [r[0] for r in rows]
 
@@ -224,10 +141,7 @@ def parse_series_matrix(file_obj):
         columns=probe_ids
     )
 
-    labels = extract_labels(
-        lines,
-        sample_ids
-    )
+    labels = extract_labels(lines, sample_ids)
 
     valid_samples = [
         s for s in sample_ids
@@ -241,25 +155,13 @@ def parse_series_matrix(file_obj):
         index=valid_samples
     )
 
-    st.success(
-        f"Parsed {expr_df.shape[0]} samples and {expr_df.shape[1]} probes."
-    )
-
-    preview_df = pd.DataFrame({
-        "Sample_ID": valid_samples,
-        "Label": y.values
-    })
-
-    st.dataframe(preview_df)
-
     return expr_df, y
 
 
-# =========================================================
-# LOAD GPL ANNOTATION
-# =========================================================
+# =====================================================
+# GPL
+# =====================================================
 def load_annotation(path, gpl_type):
-
     ann = pd.read_csv(
         path,
         sep="\t",
@@ -274,9 +176,9 @@ def load_annotation(path, gpl_type):
         mapping = ann[["ID", "Symbol"]].dropna()
 
     elif gpl_type == "GPL17586":
-
         ann["Gene Symbol"] = ann["gene_assignment"].apply(
-            lambda x: str(x).split(" // ")[1]
+            lambda x:
+            str(x).split(" // ")[1]
             if " // " in str(x)
             else np.nan
         )
@@ -288,25 +190,15 @@ def load_annotation(path, gpl_type):
 
     mapping.columns = ["probe", "gene"]
 
-    mapping["gene"] = (
-        mapping["gene"]
-        .astype(str)
-        .str.strip()
-    )
-
     return dict(
-        zip(
-            mapping["probe"],
-            mapping["gene"]
-        )
+        zip(mapping["probe"], mapping["gene"])
     )
 
 
-# =========================================================
+# =====================================================
 # PROBE TO GENE
-# =========================================================
+# =====================================================
 def convert_probe_to_gene(expr_df, mapping):
-
     common_probe = [
         p for p in expr_df.columns
         if p in mapping
@@ -320,32 +212,27 @@ def convert_probe_to_gene(expr_df, mapping):
     ]
 
     expr_df = (
-        expr_df.T
-        .groupby(level=0)
-        .mean()
-        .T
+        expr_df.T.groupby(level=0).mean().T
     )
 
     return expr_df
 
 
-# =========================================================
+# =====================================================
 # DEA
-# =========================================================
+# =====================================================
 def differential_expression(
     X,
     y,
-    logfc_thresh=1.0,
+    logfc_thresh=0.5,
     pval_thresh=0.05
 ):
-
     results = []
 
     tumor_idx = y[y == 1].index
     normal_idx = y[y == 0].index
 
     for gene in X.columns:
-
         tumor = X.loc[tumor_idx, gene]
         normal = X.loc[normal_idx, gene]
 
@@ -357,34 +244,27 @@ def differential_expression(
             (normal.mean() + 1e-8)
         )
 
-        t_stat, pval = stats.ttest_ind(
+        _, pval = stats.ttest_ind(
             tumor,
             normal,
             equal_var=False
         )
 
-        effect_size = (
-            tumor.mean() - normal.mean()
-        ) / (
-            np.sqrt(
-                (tumor.std()**2 + normal.std()**2)/2
-            ) + 1e-8
-        )
-
         results.append([
             gene,
             logfc,
-            pval,
-            abs(effect_size)
+            pval
         ])
+
+    if len(results) == 0:
+        return [], pd.DataFrame()
 
     res_df = pd.DataFrame(
         results,
         columns=[
             "gene",
             "logFC",
-            "pvalue",
-            "effect_size"
+            "pvalue"
         ]
     )
 
@@ -394,60 +274,49 @@ def differential_expression(
 
     res_df["adj_p"] = adj_p
 
-    score = (
-        abs(res_df["logFC"]) *
-        res_df["effect_size"] *
-        -np.log10(res_df["adj_p"] + 1e-8)
-    )
-
-    res_df["score"] = score
-
     sig = res_df[
+        (abs(res_df["logFC"]) >= logfc_thresh)
+        &
         (res_df["adj_p"] < pval_thresh)
     ]
 
     if len(sig) < 50:
-        sig = res_df.nlargest(
-            200,
-            "score"
+        sig = res_df.nsmallest(
+            500,
+            "adj_p"
         )
 
-    return sig["gene"].tolist()
+    return sig["gene"].tolist(), res_df
 
 
-
-# =========================================================
+# =====================================================
 # MRMR
-# =========================================================
-def mrmr_selection(X, y, k=20):
+# =====================================================
+def mrmr_selection(X, y, k):
+    if X.shape[1] == 0:
+        return []
 
-    mi = mutual_info_classif(
-        X,
-        y,
-        random_state=42
+    k = min(k, X.shape[1])
+
+    return mrmr_classif(
+        X=X,
+        y=y,
+        K=k,
+        n_jobs=1
     )
 
-    mi_df = pd.DataFrame({
-        "feature": X.columns,
-        "mi": mi
-    }).sort_values(
-        "mi",
-        ascending=False
-    )
 
-    return mi_df.head(k)["feature"].tolist()
-
-
-# =========================================================
+# =====================================================
 # LASSO
-# =========================================================
+# =====================================================
 def lasso_selection(X, y):
+    if X.shape[1] == 0:
+        return []
 
     model = LogisticRegressionCV(
         penalty="l1",
-        solver="saga",
+        solver="liblinear",
         cv=5,
-        random_state=42,
         max_iter=5000
     )
 
@@ -463,78 +332,181 @@ def lasso_selection(X, y):
     return selected
 
 
+# =====================================================
+# METRICS
+# =====================================================
+def calculate_metrics(y_true, y_pred, y_prob):
+    tn, fp, fn, tp = confusion_matrix(
+        y_true,
+        y_pred
+    ).ravel()
+
+    accuracy = (tp + tn)/(tp + tn + fp + fn)
+
+    precision = tp/(tp+fp) if (tp+fp) > 0 else 0
+    recall = tp/(tp+fn) if (tp+fn) > 0 else 0
+    specificity = tn/(tn+fp) if (tn+fp) > 0 else 0
+
+    f1 = (
+        2 * precision * recall /
+        (precision + recall)
+        if (precision + recall) > 0 else 0
+    )
+
+    auc_score = roc_auc_score(
+        y_true,
+        y_prob
+    )
+
+    denominator = np.sqrt(
+        (tp+fp)*(tp+fn)*(tn+fp)*(tn+fn)
+    )
+
+    mcc = (
+        ((tp*tn)-(fp*fn))/denominator
+        if denominator > 0 else 0
+    )
+
+    return {
+        "Accuracy": accuracy,
+        "Precision": precision,
+        "Recall": recall,
+        "Specificity": specificity,
+        "F1": f1,
+        "AUC": auc_score,
+        "MCC": mcc
+    }
+
+
+# =====================================================
+# BOOTSTRAP AUC CI
+# =====================================================
+def bootstrap_auc_ci(
+    y_true,
+    y_prob,
+    n_bootstrap=1000
+):
+    rng = np.random.RandomState(42)
+    auc_scores = []
+
+    for _ in range(n_bootstrap):
+        idx = rng.randint(
+            0,
+            len(y_true),
+            len(y_true)
+        )
+
+        if len(np.unique(y_true.iloc[idx])) < 2:
+            continue
+
+        auc_scores.append(
+            roc_auc_score(
+                y_true.iloc[idx],
+                y_prob[idx]
+            )
+        )
+
+    lower = np.percentile(auc_scores, 2.5)
+    upper = np.percentile(auc_scores, 97.5)
+
+    return lower, upper
+
+
+# =====================================================
+# TRAIN MODELS
+# =====================================================
 def train_models(
     X_train,
     y_train,
     X_test,
     y_test
 ):
-
     models = {
         "SVM": SVC(
-            kernel="linear",   # ganti dari rbf
+            kernel="linear",
             C=0.1,
             probability=True,
-            random_state=42
+            class_weight="balanced"
         ),
-
         "RandomForest": RandomForestClassifier(
-            n_estimators=500,
-            max_depth=5,
-            min_samples_leaf=5,
+            n_estimators=1000,
+            max_depth=10,
             random_state=42
         ),
-
         "LogisticRegression": LogisticRegression(
-            C=1.0,
-            random_state=42,
+            class_weight="balanced",
             max_iter=5000
         )
     }
 
     results = {}
 
+    cv = StratifiedKFold(
+        n_splits=5,
+        shuffle=True,
+        random_state=42
+    )
+
     for name, model in models.items():
+
+        cv_scores = cross_val_score(
+            clone(model),
+            X_train,
+            y_train,
+            cv=cv,
+            scoring="f1"
+        )
 
         model.fit(X_train, y_train)
 
         y_prob = model.predict_proba(X_test)[:, 1]
 
-        # threshold adaptif berdasarkan median probability
-        threshold = np.median(y_prob)
+        fpr, tpr, thresholds = roc_curve(
+            y_test,
+            y_prob
+        )
 
-        y_pred = (y_prob >= threshold).astype(int)
+        threshold = thresholds[
+            np.argmax(tpr - fpr)
+        ]
+
+        y_pred = (
+            y_prob >= threshold
+        ).astype(int)
+
+        metrics = calculate_metrics(
+            y_test,
+            y_pred,
+            y_prob
+        )
+
+        auc_lower, auc_upper = bootstrap_auc_ci(
+            y_test,
+            y_prob
+        )
 
         results[name] = {
-            "Accuracy": accuracy_score(y_test, y_pred),
-            "Precision": precision_score(y_test, y_pred, zero_division=0),
-            "Recall": recall_score(y_test, y_pred, zero_division=0),
-            "F1": f1_score(y_test, y_pred, zero_division=0),
-            "AUC": roc_auc_score(y_test, y_prob),
-            "MCC": matthews_corrcoef(y_test, y_pred),
+            "model": model,
             "y_pred": y_pred,
-            "y_prob": y_prob
+            "y_prob": y_prob,
+            "CV_F1_Mean": cv_scores.mean(),
+            "CV_F1_STD": cv_scores.std(),
+            "AUC_CI_Lower": auc_lower,
+            "AUC_CI_Upper": auc_upper,
+            **metrics
         }
 
     return results
 
 
-
-
-# =========================================================
+# =====================================================
 # PLOTS
-# =========================================================
+# =====================================================
 def plot_confusion(y_true, y_pred):
-
-    cm = confusion_matrix(
-        y_true,
-        y_pred
-    )
-
     fig, ax = plt.subplots()
 
     sns.heatmap(
-        cm,
+        confusion_matrix(y_true, y_pred),
         annot=True,
         fmt="d",
         cmap="Blues",
@@ -545,7 +517,6 @@ def plot_confusion(y_true, y_pred):
 
 
 def plot_roc(y_true, y_prob):
-
     fpr, tpr, _ = roc_curve(
         y_true,
         y_prob
@@ -554,71 +525,26 @@ def plot_roc(y_true, y_prob):
     fig, ax = plt.subplots()
 
     ax.plot(fpr, tpr)
-    ax.plot(
-        [0, 1],
-        [0, 1],
-        "--"
-    )
+    ax.plot([0, 1], [0, 1], "--")
 
     return fig
 
 
-# =========================================================
+# =====================================================
 # SIDEBAR
-# =========================================================
-st.sidebar.header("Parameters")
+# =====================================================
+impute_k = st.sidebar.slider("KNN K", 1, 10, 5)
+logfc_thresh = st.sidebar.slider("logFC", 0.1, 2.0, 0.5)
+pval_thresh = st.sidebar.slider("p-value", 0.01, 0.10, 0.05)
+mrmr_k = st.sidebar.slider("mRMR K", 10, 100, 50)
 
-impute_k = st.sidebar.slider(
-    "KNN K",
-    1,
-    10,
-    5
-)
-
-logfc_thresh = st.sidebar.slider(
-    "logFC Threshold",
-    1.0,
-    3.0,
-    1.5
-)
-
-pval_thresh = st.sidebar.slider(
-    "Adjusted p-value",
-    0.01,
-    0.10,
-    0.05
-)
-
-mrmr_k = st.sidebar.slider(
-    "mRMR K",
-    10,
-    100,
-    50
-)
-
-# lasso_c is not used now because we use LogisticRegressionCV, but keep it for interface
-lasso_c = st.sidebar.slider(
-    "LASSO C (for CV)",
-    0.01,
-    1.0,
-    0.1
-)
-
-use_smote = st.sidebar.checkbox(
-    "Use SMOTE for imbalance handling",
-    value=True
-)
-
-run = st.sidebar.button(
-    "🚀 Run Pipeline"
-)
+run = st.sidebar.button("Run Pipeline")
 
 
-# =========================================================
-# MAIN PIPELINE
-# =========================================================
+# =====================================================
+# MAIN
+# =====================================================
 if run:
-
     data_dir = "data"
 
     expr1, y1 = parse_series_matrix(
@@ -658,22 +584,40 @@ if run:
         .intersection(expr3.columns)
     )
 
-    st.success(
-        f"Common genes: {len(common_genes)}"
-    )
-
     X_train = pd.concat([
         expr1[common_genes],
         expr2[common_genes]
     ])
 
-    y_train = pd.concat([
-        y1,
-        y2
-    ])
+    y_train = pd.concat([y1, y2])
 
     X_test = expr3[common_genes]
     y_test = y3
+
+    batch_labels = (
+        ["batch1"] * len(expr1)
+        +
+        ["batch2"] * len(expr2)
+    )
+
+    X_train = pycombat(
+        X_train.T,
+        batch_labels
+    ).T
+
+    scaler = StandardScaler()
+
+    X_train = pd.DataFrame(
+        scaler.fit_transform(X_train),
+        columns=X_train.columns,
+        index=X_train.index
+    )
+
+    X_test = pd.DataFrame(
+        scaler.transform(X_test),
+        columns=X_test.columns,
+        index=X_test.index
+    )
 
     imputer = KNNImputer(
         n_neighbors=impute_k
@@ -681,64 +625,27 @@ if run:
 
     X_train = pd.DataFrame(
         imputer.fit_transform(X_train),
-        index=X_train.index,
-        columns=X_train.columns
+        columns=X_train.columns,
+        index=X_train.index
     )
 
     X_test = pd.DataFrame(
         imputer.transform(X_test),
-        index=X_test.index,
-        columns=X_test.columns
+        columns=X_test.columns,
+        index=X_test.index
     )
 
-    scaler = MinMaxScaler(feature_range=(-1, 1))
-
-    X_train = pd.DataFrame(
-        scaler.fit_transform(X_train),
-        index=X_train.index,
-        columns=X_train.columns
-    )
-
-    X_test = pd.DataFrame(
-        scaler.transform(X_test),
-        index=X_test.index,
-        columns=X_test.columns
-    )
-
-    st.subheader(
-        "Differential Expression Analysis"
-    )
-
-    dea_genes = differential_expression(
+    dea_genes, dea_df = differential_expression(
         X_train,
         y_train,
         logfc_thresh,
         pval_thresh
     )
 
-    st.write(
-        f"DEA selected: {len(dea_genes)}"
-    )
-
-    X_train_dea = X_train[dea_genes]
-    X_test_dea = X_test[dea_genes]
-
-    st.subheader(
-        "mRMR Selection"
-    )
-
     mrmr_genes = mrmr_selection(
-        X_train_dea,
+        X_train[dea_genes],
         y_train,
-        min(mrmr_k, len(dea_genes))
-    )
-
-    st.write(
-        f"mRMR selected: {len(mrmr_genes)}"
-    )
-
-    st.subheader(
-        "LASSO Selection"
+        mrmr_k
     )
 
     final_features = lasso_selection(
@@ -746,82 +653,8 @@ if run:
         y_train
     )
 
-    st.success(
-        f"Final selected genes: {len(final_features)}"
-    )
-
     X_train_final = X_train[final_features]
     X_test_final = X_test[final_features]
-
-    # =========================================================
-    # NEW: BALANCING via DOWNSAMPLING of MAJORITY CLASS
-    # =========================================================
-    st.subheader("Class Distribution Before Balancing")
-    st.write(pd.Series(y_train).value_counts())
-
-    # Combine features and labels to a single DataFrame for easier resampling
-    train_df = X_train_final.copy()
-    train_df['class'] = y_train
-
-    # Separate majority (tumor=1) and minority (normal=0)
-    majority = train_df[train_df['class'] == 1]
-    minority = train_df[train_df['class'] == 0]
-
-    # Downsample majority to match size of minority
-    if len(majority) > len(minority):
-        majority_downsampled = resample(majority,
-                                        replace=False,
-                                        n_samples=len(minority),
-                                        random_state=42)
-        balanced_df = pd.concat([majority_downsampled, minority])
-    else:
-        # If majority is already smaller (unlikely), keep as is
-        balanced_df = train_df
-
-    X_train_final = balanced_df.drop('class', axis=1)
-    y_train = balanced_df['class']
-
-    st.subheader("Class Distribution After Downsampling (1:1 ratio)")
-    st.write(pd.Series(y_train).value_counts())
-
-    # Optional SMOTE (if user selected) – this will generate synthetic minority samples
-    if use_smote:
-
-        class_counts = pd.Series(y_train).value_counts()
-
-        majority_count = class_counts.max()
-        minority_count = class_counts.min()
-
-        # hanya jalankan SMOTE jika memang masih imbalance
-        if majority_count > minority_count:
-
-            ratio = majority_count / minority_count
-
-            k_neighbors = min(3, minority_count - 1)
-
-            if k_neighbors < 1:
-                k_neighbors = 1
-
-            smote = SMOTE(
-                sampling_strategy=1.0,
-                random_state=42,
-                k_neighbors=k_neighbors
-            )
-
-            X_train_final, y_train = smote.fit_resample(
-                X_train_final,
-                y_train
-            )
-
-            st.subheader("Class Distribution After SMOTE")
-            st.write(pd.Series(y_train).value_counts())
-
-        else:
-            st.info("SMOTE skipped: dataset already balanced.")
-
-    st.subheader(
-        "Model Performance"
-    )
 
     results = train_models(
         X_train_final,
@@ -830,63 +663,195 @@ if run:
         y_test
     )
 
-    metrics_df = pd.DataFrame(
-        results
-    ).T.drop(
-        columns=[
-            "y_pred",
-            "y_prob"
-        ]
+    metrics_df = pd.DataFrame(results).T.drop(
+        columns=["model", "y_pred", "y_prob"]
     )
 
+    st.subheader("Model Performance")
     st.dataframe(metrics_df)
 
+    st.subheader("Cross Validation")
     for model_name, result in results.items():
+        st.write(
+            f"{model_name}: "
+            f"{result['CV_F1_Mean']:.4f} ± {result['CV_F1_STD']:.4f}"
+        )
 
-        st.subheader(model_name)
-
-        col1, col2 = st.columns(2)
-
-        with col1:
-            st.pyplot(
-                plot_confusion(
-                    y_test,
-                    result["y_pred"]
-                )
-            )
-
-        with col2:
-            st.pyplot(
-                plot_roc(
-                    y_test,
-                    result["y_prob"]
-                )
-            )
-
+    st.subheader("AUC 95% Confidence Interval")
     for model_name, result in results.items():
-        st.write(model_name)
-        st.write(pd.Series(result["y_pred"]).value_counts())
-        
-        st.write("Prediction probability summary")
-        st.write(pd.Series(result["y_prob"]).describe())
+        st.write(
+            f"{model_name}: "
+            f"{result['AUC_CI_Lower']:.4f} - {result['AUC_CI_Upper']:.4f}"
+        )
 
-    st.write("Final training distribution (after all balancing)")
-    st.write(pd.Series(y_train).value_counts())
+    best_model_name = max(
+        results.items(),
+        key=lambda x: x[1]["AUC"]
+    )[0]
 
-    st.write("Test distribution (original, imbalanced)")
-    st.write(pd.Series(y_test).value_counts())
+    best_model = results[best_model_name]["model"]
 
-    st.write("Selected genes")
+    st.subheader(f"SHAP Analysis ({best_model_name})")
+
+    if best_model_name == "RandomForest":
+        explainer = shap.TreeExplainer(best_model)
+        shap_values = explainer.shap_values(X_test_final)
+
+    else:
+        explainer = shap.Explainer(
+            best_model.predict,
+            X_train_final
+        )
+        shap_values = explainer(X_test_final)
+
+    fig = plt.figure()
+
+    if isinstance(shap_values, list):
+        shap.summary_plot(
+            shap_values[1],
+            X_test_final,
+            show=False
+        )
+    else:
+        shap.summary_plot(
+            shap_values,
+            X_test_final,
+            show=False
+        )
+
+    st.pyplot(fig)
+
+    st.subheader("Selected Genes")
     st.write(final_features)
     
-    # Show mean probability for the best model (last model in loop)
-    st.write("Mean tumor probability (last model):", np.mean(list(results.values())[-1]["y_prob"]))
-    st.write("Min tumor probability:", np.min(list(results.values())[-1]["y_prob"]))
-    st.write("Max tumor probability:", np.max(list(results.values())[-1]["y_prob"]))
+    # =====================================================
+# EXTRA VISUALIZATION DASHBOARD (APPEND ONLY)
+# =====================================================
+
+st.markdown("---")
+st.header("📊 Additional Analytics Dashboard")
+
+# =====================================================
+# 1. MODEL COMPARISON HEATMAP
+# =====================================================
+st.subheader("📌 Model Performance Heatmap")
+    
+plot_df = pd.DataFrame({
+    model: {
+        "Accuracy": res["Accuracy"],
+        "Precision": res["Precision"],
+        "Recall": res["Recall"],
+        "Specificity": res["Specificity"],
+        "F1": res["F1"],
+        "AUC": res["AUC"]
+    }
+    for model, res in results.items()
+}).T
+
+fig, ax = plt.subplots(figsize=(10, 4))
+sns.heatmap(plot_df, annot=True, cmap="YlGnBu", ax=ax)
+st.pyplot(fig)
 
 
-    st.download_button(
-        "📥 Download Selected Genes",
-        "\n".join(final_features),
-        "selected_genes.txt"
-    )
+# =====================================================
+# 2. ROC CURVE ALL MODELS
+# =====================================================
+st.subheader("📈 ROC Curve Comparison (All Models)")
+
+fig, ax = plt.subplots()
+
+for name, res in results.items():
+    fpr, tpr, _ = roc_curve(y_test, res["y_prob"])
+    ax.plot(fpr, tpr, label=f"{name} (AUC={res['AUC']:.3f})")
+
+ax.plot([0, 1], [0, 1], "--", color="gray")
+ax.set_xlabel("False Positive Rate")
+ax.set_ylabel("True Positive Rate")
+ax.legend()
+
+st.pyplot(fig)
+
+
+# =====================================================
+# 3. CONFUSION MATRIX GRID
+# =====================================================
+st.subheader("🧩 Confusion Matrix Grid View")
+
+cols = st.columns(len(results))
+
+for i, (name, res) in enumerate(results.items()):
+    with cols[i]:
+        st.markdown(f"**{name}**")
+        fig, ax = plt.subplots()
+        sns.heatmap(
+            confusion_matrix(y_test, res["y_pred"]),
+            annot=True,
+            fmt="d",
+            cmap="Blues",
+            ax=ax
+        )
+        st.pyplot(fig)
+
+
+# =====================================================
+# 4. PCA GLOBAL VIEW (EXTRA INSIGHT)
+# =====================================================
+st.subheader("🧬 PCA Global Structure View")
+
+pca = PCA(n_components=2)
+X_pca = pca.fit_transform(X_train_final)
+
+fig, ax = plt.subplots()
+scatter = ax.scatter(
+    X_pca[:, 0],
+    X_pca[:, 1],
+    c=y_train,
+    cmap="coolwarm",
+    alpha=0.7
+)
+
+ax.set_xlabel("PC1")
+ax.set_ylabel("PC2")
+
+st.pyplot(fig)
+
+
+# =====================================================
+# 5. TOP GENE CORRELATION NETWORK (HEATMAP)
+# =====================================================
+st.subheader("🔥 Top Gene Correlation Map")
+
+top_n = min(20, len(final_features))
+
+fig, ax = plt.subplots(figsize=(10, 6))
+sns.heatmap(
+    X_train_final[final_features[:top_n]].corr(),
+    cmap="coolwarm",
+    ax=ax
+)
+
+st.pyplot(fig)
+
+
+# =====================================================
+# 6. SIMPLE FEATURE IMPORTANCE VIEW
+# =====================================================
+st.subheader("🧠 Feature Usage Overview")
+
+importance_df = pd.DataFrame({
+    "Gene": final_features
+})
+
+st.dataframe(importance_df)
+
+
+# =====================================================
+# 7. DATA SUMMARY
+# =====================================================
+st.subheader("📌 Dataset Summary")
+
+st.write("Train shape:", X_train_final.shape)
+st.write("Test shape:", X_test_final.shape)
+st.write("Number of selected genes:", len(final_features))
+st.write("Class distribution:")
+st.write(y_train.value_counts())
