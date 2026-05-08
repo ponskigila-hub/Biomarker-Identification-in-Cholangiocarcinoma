@@ -725,133 +725,133 @@ if run:
     st.write(final_features)
     
     # =====================================================
-# EXTRA VISUALIZATION DASHBOARD (APPEND ONLY)
-# =====================================================
+    # EXTRA VISUALIZATION DASHBOARD (APPEND ONLY)
+    # =====================================================
 
-st.markdown("---")
-st.header("📊 Additional Analytics Dashboard")
+    st.markdown("---")
+    st.header("📊 Additional Analytics Dashboard")
 
-# =====================================================
-# 1. MODEL COMPARISON HEATMAP
-# =====================================================
-st.subheader("📌 Model Performance Heatmap")
-    
-plot_df = pd.DataFrame({
-    model: {
-        "Accuracy": res["Accuracy"],
-        "Precision": res["Precision"],
-        "Recall": res["Recall"],
-        "Specificity": res["Specificity"],
-        "F1": res["F1"],
-        "AUC": res["AUC"]
-    }
-    for model, res in results.items()
-}).T
+    # =====================================================
+    # 1. MODEL COMPARISON HEATMAP
+    # =====================================================
+    st.subheader("📌 Model Performance Heatmap")
 
-fig, ax = plt.subplots(figsize=(10, 4))
-sns.heatmap(plot_df, annot=True, cmap="YlGnBu", ax=ax)
-st.pyplot(fig)
+    plot_df = pd.DataFrame({
+        model: {
+            "Accuracy": res["Accuracy"],
+            "Precision": res["Precision"],
+            "Recall": res["Recall"],
+            "Specificity": res["Specificity"],
+            "F1": res["F1"],
+            "AUC": res["AUC"]
+        }
+        for model, res in results.items()
+    }).T
 
-
-# =====================================================
-# 2. ROC CURVE ALL MODELS
-# =====================================================
-st.subheader("📈 ROC Curve Comparison (All Models)")
-
-fig, ax = plt.subplots()
-
-for name, res in results.items():
-    fpr, tpr, _ = roc_curve(y_test, res["y_prob"])
-    ax.plot(fpr, tpr, label=f"{name} (AUC={res['AUC']:.3f})")
-
-ax.plot([0, 1], [0, 1], "--", color="gray")
-ax.set_xlabel("False Positive Rate")
-ax.set_ylabel("True Positive Rate")
-ax.legend()
-
-st.pyplot(fig)
+    fig, ax = plt.subplots(figsize=(10, 4))
+    sns.heatmap(plot_df, annot=True, cmap="YlGnBu", ax=ax)
+    st.pyplot(fig)
 
 
-# =====================================================
-# 3. CONFUSION MATRIX GRID
-# =====================================================
-st.subheader("🧩 Confusion Matrix Grid View")
+    # =====================================================
+    # 2. ROC CURVE ALL MODELS
+    # =====================================================
+    st.subheader("📈 ROC Curve Comparison (All Models)")
 
-cols = st.columns(len(results))
+    fig, ax = plt.subplots()
 
-for i, (name, res) in enumerate(results.items()):
-    with cols[i]:
-        st.markdown(f"**{name}**")
-        fig, ax = plt.subplots()
-        sns.heatmap(
-            confusion_matrix(y_test, res["y_pred"]),
-            annot=True,
-            fmt="d",
-            cmap="Blues",
-            ax=ax
-        )
-        st.pyplot(fig)
+    for name, res in results.items():
+        fpr, tpr, _ = roc_curve(y_test, res["y_prob"])
+        ax.plot(fpr, tpr, label=f"{name} (AUC={res['AUC']:.3f})")
+
+    ax.plot([0, 1], [0, 1], "--", color="gray")
+    ax.set_xlabel("False Positive Rate")
+    ax.set_ylabel("True Positive Rate")
+    ax.legend()
+
+    st.pyplot(fig)
 
 
-# =====================================================
-# 4. PCA GLOBAL VIEW (EXTRA INSIGHT)
-# =====================================================
-st.subheader("🧬 PCA Global Structure View")
+    # =====================================================
+    # 3. CONFUSION MATRIX GRID
+    # =====================================================
+    st.subheader("🧩 Confusion Matrix Grid View")
 
-pca = PCA(n_components=2)
-X_pca = pca.fit_transform(X_train_final)
+    cols = st.columns(len(results))
 
-fig, ax = plt.subplots()
-scatter = ax.scatter(
-    X_pca[:, 0],
-    X_pca[:, 1],
-    c=y_train,
-    cmap="coolwarm",
-    alpha=0.7
-)
-
-ax.set_xlabel("PC1")
-ax.set_ylabel("PC2")
-
-st.pyplot(fig)
+    for i, (name, res) in enumerate(results.items()):
+        with cols[i]:
+            st.markdown(f"**{name}**")
+            fig, ax = plt.subplots()
+            sns.heatmap(
+                confusion_matrix(y_test, res["y_pred"]),
+                annot=True,
+                fmt="d",
+                cmap="Blues",
+                ax=ax
+            )
+            st.pyplot(fig)
 
 
-# =====================================================
-# 5. TOP GENE CORRELATION NETWORK (HEATMAP)
-# =====================================================
-st.subheader("🔥 Top Gene Correlation Map")
+    # =====================================================
+    # 4. PCA GLOBAL VIEW (EXTRA INSIGHT)
+    # =====================================================
+    st.subheader("🧬 PCA Global Structure View")
 
-top_n = min(20, len(final_features))
+    pca = PCA(n_components=2)
+    X_pca = pca.fit_transform(X_train_final)
 
-fig, ax = plt.subplots(figsize=(10, 6))
-sns.heatmap(
-    X_train_final[final_features[:top_n]].corr(),
-    cmap="coolwarm",
-    ax=ax
-)
+    fig, ax = plt.subplots()
+    scatter = ax.scatter(
+        X_pca[:, 0],
+        X_pca[:, 1],
+        c=y_train,
+        cmap="coolwarm",
+        alpha=0.7
+    )
 
-st.pyplot(fig)
+    ax.set_xlabel("PC1")
+    ax.set_ylabel("PC2")
 
-
-# =====================================================
-# 6. SIMPLE FEATURE IMPORTANCE VIEW
-# =====================================================
-st.subheader("🧠 Feature Usage Overview")
-
-importance_df = pd.DataFrame({
-    "Gene": final_features
-})
-
-st.dataframe(importance_df)
+    st.pyplot(fig)
 
 
-# =====================================================
-# 7. DATA SUMMARY
-# =====================================================
-st.subheader("📌 Dataset Summary")
+    # =====================================================
+    # 5. TOP GENE CORRELATION NETWORK (HEATMAP)
+    # =====================================================
+    st.subheader("🔥 Top Gene Correlation Map")
 
-st.write("Train shape:", X_train_final.shape)
-st.write("Test shape:", X_test_final.shape)
-st.write("Number of selected genes:", len(final_features))
-st.write("Class distribution:")
-st.write(y_train.value_counts())
+    top_n = min(20, len(final_features))
+
+    fig, ax = plt.subplots(figsize=(10, 6))
+    sns.heatmap(
+        X_train_final[final_features[:top_n]].corr(),
+        cmap="coolwarm",
+        ax=ax
+    )
+
+    st.pyplot(fig)
+
+
+    # =====================================================
+    # 6. SIMPLE FEATURE IMPORTANCE VIEW
+    # =====================================================
+    st.subheader("🧠 Feature Usage Overview")
+
+    importance_df = pd.DataFrame({
+        "Gene": final_features
+    })
+
+    st.dataframe(importance_df)
+
+
+    # =====================================================
+    # 7. DATA SUMMARY
+    # =====================================================
+    st.subheader("📌 Dataset Summary")
+
+    st.write("Train shape:", X_train_final.shape)
+    st.write("Test shape:", X_test_final.shape)
+    st.write("Number of selected genes:", len(final_features))
+    st.write("Class distribution:")
+    st.write(y_train.value_counts())
