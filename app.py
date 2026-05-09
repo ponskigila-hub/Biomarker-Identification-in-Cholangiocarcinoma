@@ -224,7 +224,7 @@ def convert_probe_to_gene(expr_df, mapping):
 def differential_expression(
     X,
     y,
-    logfc_thresh=0.5,
+    logfc_thresh=1.0,   # CHANGED: 0.5 -> 1.0
     pval_thresh=0.05
 ):
     results = []
@@ -534,9 +534,28 @@ def plot_roc(y_true, y_prob):
 # SIDEBAR
 # =====================================================
 impute_k = st.sidebar.slider("KNN K", 1, 10, 5)
-logfc_thresh = st.sidebar.slider("logFC", 0.1, 2.0, 0.5)
-pval_thresh = st.sidebar.slider("p-value", 0.01, 0.10, 0.05)
-mrmr_k = st.sidebar.slider("mRMR K", 10, 100, 50)
+
+# CHANGED: default 0.5 -> 1.0
+logfc_thresh = st.sidebar.slider(
+    "logFC",
+    0.1,
+    2.0,
+    1.0
+)
+
+pval_thresh = st.sidebar.slider(
+    "p-value",
+    0.01,
+    0.10,
+    0.05
+)
+
+mrmr_k = st.sidebar.slider(
+    "mRMR K",
+    10,
+    100,
+    50
+)
 
 run = st.sidebar.button("Run Pipeline")
 
@@ -605,20 +624,10 @@ if run:
         batch_labels
     ).T
 
-    scaler = StandardScaler()
-
-    X_train = pd.DataFrame(
-        scaler.fit_transform(X_train),
-        columns=X_train.columns,
-        index=X_train.index
-    )
-
-    X_test = pd.DataFrame(
-        scaler.transform(X_test),
-        columns=X_test.columns,
-        index=X_test.index
-    )
-
+    # =====================================================
+    # CHANGED:
+    # KNN IMPUTER FIRST
+    # =====================================================
     imputer = KNNImputer(
         n_neighbors=impute_k
     )
@@ -631,6 +640,24 @@ if run:
 
     X_test = pd.DataFrame(
         imputer.transform(X_test),
+        columns=X_test.columns,
+        index=X_test.index
+    )
+
+    # =====================================================
+    # CHANGED:
+    # STANDARD SCALER AFTER IMPUTATION
+    # =====================================================
+    scaler = StandardScaler()
+
+    X_train = pd.DataFrame(
+        scaler.fit_transform(X_train),
+        columns=X_train.columns,
+        index=X_train.index
+    )
+
+    X_test = pd.DataFrame(
+        scaler.transform(X_test),
         columns=X_test.columns,
         index=X_test.index
     )
@@ -693,47 +720,46 @@ if run:
 
     st.subheader(f"SHAP Analysis ({best_model_name})")
 
-    if best_model_name == "RandomForest":
-        explainer = shap.TreeExplainer(best_model)
-        shap_values = explainer.shap_values(X_test_final)
+    try:
+        if best_model_name == "RandomForest":
+            explainer = shap.TreeExplainer(best_model)
+            shap_values = explainer.shap_values(X_test_final)
 
-    else:
-        explainer = shap.Explainer(
-            best_model.predict,
-            X_train_final
-        )
-        shap_values = explainer(X_test_final)
+            plt.figure(figsize=(10, 6))
+            shap.summary_plot(
+                shap_values[1],
+                X_test_final,
+                show=False
+            )
+            st.pyplot(plt.gcf())
+            plt.clf()
 
-    fig = plt.figure()
+        else:
+            explainer = shap.Explainer(
+                best_model.predict_proba,
+                X_train_final
+            )
 
-    if isinstance(shap_values, list):
-        shap.summary_plot(
-            shap_values[1],
-            X_test_final,
-            show=False
-        )
-    else:
-        shap.summary_plot(
-            shap_values,
-            X_test_final,
-            show=False
-        )
+            shap_values = explainer(X_test_final)
 
-    st.pyplot(fig)
+            plt.figure(figsize=(10, 6))
+            shap.summary_plot(
+                shap_values[:, :, 1],
+                X_test_final,
+                show=False
+            )
+            st.pyplot(plt.gcf())
+            plt.clf()
+
+    except Exception as e:
+        st.error(f"SHAP Error: {e}")
 
     st.subheader("Selected Genes")
     st.write(final_features)
-    
-    # =====================================================
-    # EXTRA VISUALIZATION DASHBOARD (APPEND ONLY)
-    # =====================================================
 
     st.markdown("---")
     st.header("📊 Additional Analytics Dashboard")
 
-    # =====================================================
-    # 1. MODEL COMPARISON HEATMAP
-    # =====================================================
     st.subheader("📌 Model Performance Heatmap")
 
     plot_df = pd.DataFrame({
@@ -752,10 +778,6 @@ if run:
     sns.heatmap(plot_df, annot=True, cmap="YlGnBu", ax=ax)
     st.pyplot(fig)
 
-
-    # =====================================================
-    # 2. ROC CURVE ALL MODELS
-    # =====================================================
     st.subheader("📈 ROC Curve Comparison (All Models)")
 
     fig, ax = plt.subplots()
@@ -771,10 +793,6 @@ if run:
 
     st.pyplot(fig)
 
-
-    # =====================================================
-    # 3. CONFUSION MATRIX GRID
-    # =====================================================
     st.subheader("🧩 Confusion Matrix Grid View")
 
     cols = st.columns(len(results))
@@ -792,17 +810,13 @@ if run:
             )
             st.pyplot(fig)
 
-
-    # =====================================================
-    # 4. PCA GLOBAL VIEW (EXTRA INSIGHT)
-    # =====================================================
     st.subheader("🧬 PCA Global Structure View")
 
     pca = PCA(n_components=2)
     X_pca = pca.fit_transform(X_train_final)
 
     fig, ax = plt.subplots()
-    scatter = ax.scatter(
+    ax.scatter(
         X_pca[:, 0],
         X_pca[:, 1],
         c=y_train,
@@ -815,10 +829,6 @@ if run:
 
     st.pyplot(fig)
 
-
-    # =====================================================
-    # 5. TOP GENE CORRELATION NETWORK (HEATMAP)
-    # =====================================================
     st.subheader("🔥 Top Gene Correlation Map")
 
     top_n = min(20, len(final_features))
@@ -832,10 +842,6 @@ if run:
 
     st.pyplot(fig)
 
-
-    # =====================================================
-    # 6. SIMPLE FEATURE IMPORTANCE VIEW
-    # =====================================================
     st.subheader("🧠 Feature Usage Overview")
 
     importance_df = pd.DataFrame({
@@ -844,10 +850,6 @@ if run:
 
     st.dataframe(importance_df)
 
-
-    # =====================================================
-    # 7. DATA SUMMARY
-    # =====================================================
     st.subheader("📌 Dataset Summary")
 
     st.write("Train shape:", X_train_final.shape)
