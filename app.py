@@ -18,6 +18,7 @@ from sklearn.linear_model import LogisticRegression, LogisticRegressionCV
 from sklearn.svm import SVC
 from sklearn.ensemble import RandomForestClassifier
 from sklearn.decomposition import PCA
+from sklearn.model_selection import GridSearchCV
 
 from sklearn.metrics import (
     confusion_matrix,
@@ -219,6 +220,60 @@ def parse_series_matrix(file_obj):
     )
 
     return expr_df, y
+
+
+# =====================================================
+# SCALE HARMONIZATION (NEW)
+# =====================================================
+# ROOT CAUSE FOUND (2026-08-11, RF collapse investigation):
+# GSE76297 is deposited already log2-scale (~11-12), but
+# GSE132305 and GSE32225 are deposited as raw/linear
+# intensities (tens to thousands). Because no dataset was
+# ever log2-transformed, ComBat (fit on train only) and
+# StandardScaler (fit on train only) produced z-scores in
+# the external test set that were 10-1000x outside the
+# training range -> RandomForest routed every external
+# sample into the same terminal leaf (frozen probability),
+# and SVM/LR were pushed toward predicting the majority
+# class rather than genuinely discriminating.
+#
+# Fix: detect per-dataset scale right after parsing (before
+# any batch correction/scaling) and log2-transform any
+# dataset that is not already log-scale, so all three
+# datasets are comparable before ComBat/StandardScaler see
+# them. This must run BEFORE convert_probe_to_gene so that
+# probe-level averaging happens in a consistent space.
+def auto_log2_transform(expr_df, name=""):
+    """
+    Detect whether a dataset is already log2-scale or still
+    raw/linear intensity, and log2-transform it if needed.
+
+    Heuristic: log2-scale microarray/RNA expression values
+    are almost always well under ~25. Raw/linear intensities
+    are typically in the hundreds to tens of thousands. This
+    is a standard, widely-used rule of thumb (used e.g. by
+    GEO2R itself) for auto-detecting whether a series needs
+    log transformation.
+    """
+    vals = expr_df.values.astype(float)
+    max_val = np.nanmax(vals)
+    median_val = np.nanmedian(vals)
+
+    if max_val > 100:
+        transformed = np.log2(expr_df.clip(lower=0) + 1)
+        st.info(
+            f"[{name}] raw/linear scale detected "
+            f"(max={max_val:.1f}, median={median_val:.1f}) "
+            f"-> applied log2(x + 1)"
+        )
+        return transformed
+    else:
+        st.info(
+            f"[{name}] already log2-scale "
+            f"(max={max_val:.1f}, median={median_val:.1f}) "
+            f"-> left as-is"
+        )
+        return expr_df
 
 
 # =====================================================
@@ -767,14 +822,17 @@ if run:
     expr1, y1 = parse_series_matrix(
         FileLike(os.path.join(data_dir, "GSE76297_series_matrix.txt"))
     )
+    expr1 = auto_log2_transform(expr1, "GSE76297")
 
     expr2, y2 = parse_series_matrix(
         FileLike(os.path.join(data_dir, "GSE132305_series_matrix.txt"))
     )
+    expr2 = auto_log2_transform(expr2, "GSE132305")
 
     expr3, y3 = parse_series_matrix(
         FileLike(os.path.join(data_dir, "GSE32225_series_matrix.txt"))
     )
+    expr3 = auto_log2_transform(expr3, "GSE32225")
 
     map1 = load_annotation(
         os.path.join(data_dir, "GPL17586.txt"),
@@ -843,23 +901,59 @@ if run:
     n_missing_train = int(X_train.isna().sum().sum())
     n_missing_test = int(X_test.isna().sum().sum())
 
+    # =====================================================
+    # CHANGED (threshold-transfer investigation, 2026-08-11):
+    # ComBat used to be fit ONLY on X_train (batch1/batch2),
+    # leaving GSE32225 (external, a third platform) with no
+    # batch-effect correction at all. After the log2 fix,
+    # magnitudes became comparable across datasets, but a
+    # systematic per-gene OFFSET between GSE32225 and the
+    # ComBat-corrected train set remained -- external
+    # predict_proba saturated near 0 for every sample
+    # (CCA and normal alike) even though AUC stayed high
+    # (ranking was fine, the whole cohort was just shifted).
+    #
+    # Fix: run ComBat across all THREE datasets together as
+    # three batches, BEFORE the train/test split is used for
+    # anything supervised. This is still leakage-free: ComBat
+    # only uses batch identity + expression values, never the
+    # class label y. Downstream steps that must stay
+    # train-only (DEA/mRMR/LASSO feature selection, Youden/
+    # sensitivity threshold selection) are unaffected -- they
+    # still only ever see X_train after this point.
+    # =====================================================
     batch_labels = (
         ["batch1"] * len(expr1)
         +
         ["batch2"] * len(expr2)
+        +
+        ["batch3"] * len(expr3)
     )
 
-    # Kept for the before/after ComBat visualization below.
-    X_train_pre_combat = X_train.copy()
+    X_all = pd.concat([
+        expr1[common_genes],
+        expr2[common_genes],
+        expr3[common_genes]
+    ])
 
-    X_train = pycombat(
-        X_train.T,
+    # Kept for the before/after ComBat visualization below.
+    X_train_pre_combat = X_all.loc[X_train.index].copy()
+    X3_pre_combat = X_all.loc[X_test.index].copy()
+
+    X_all_combat = pycombat(
+        X_all.T,
         batch_labels
     ).T
+
+    X_train = X_all_combat.loc[X_train.index]
+    X_test = X_all_combat.loc[X_test.index]
 
     # =====================================================
     # CHANGED:
     # KNN IMPUTER FIRST
+    # (still fit on X_train ONLY, applied/transformed to
+    # X_test -- this part was already correct and is
+    # unchanged)
     # =====================================================
     imputer = KNNImputer(
         n_neighbors=impute_k
@@ -933,6 +1027,55 @@ if run:
         X_test_final,
         y_test,
         cv
+    )
+    
+    st.markdown("---")
+    st.header("🎛️ Hyperparameter Tuning (Reviewer 2, poin 6)")
+    st.caption(
+        "GridSearchCV dijalankan di dalam training set saja (5-fold CV, "
+        "scoring=F1), tidak menyentuh data validasi eksternal."
+    )
+    
+    param_grids = {
+        "SVM": {
+            "estimator__C": [0.01, 0.1, 1, 10]
+        },
+        "RandomForest": {
+            "estimator__n_estimators": [200, 500, 1000],
+            "estimator__max_depth": [5, 10, None]
+        },
+        "LogisticRegression": {
+            "C": [0.01, 0.1, 1, 10]
+        }
+    }
+    
+    model_defs = get_model_defs()
+    tuning_rows = []
+    
+    for model_name, base_model in model_defs.items():
+        grid = param_grids[model_name]
+        gs = GridSearchCV(
+            base_model,
+            grid,
+            scoring="f1",
+            cv=cv,
+            n_jobs=-1
+        )
+        gs.fit(X_train_final, y_train)
+        tuning_rows.append({
+            "Model": model_name,
+            "Best params": str(gs.best_params_),
+            "Best CV F1 (training only)": round(gs.best_score_, 4),
+            "Default-config CV F1": round(results[model_name]["CV_F1_Mean"], 4)
+        })
+    
+    st.dataframe(pd.DataFrame(tuning_rows).set_index("Model"))
+    st.caption(
+        "Bandingkan kolom terakhir: kalau selisihnya kecil, konfigurasi manual "
+        "di paper sudah cukup dekat optimal dan bisa dijelaskan sebagai "
+        "'grid search dijalankan, hasil serupa dengan setting awal'. Kalau "
+        "selisih besar, pertimbangkan pakai Best params untuk hasil final "
+        "dan laporkan proses grid search ini di Methodology."
     )
 
     metrics_df = pd.DataFrame(results).T.drop(
@@ -1080,36 +1223,29 @@ if run:
 
     st.subheader(f"SHAP Analysis ({best_model_name})")
 
+    # CHANGED: RandomForest is now wrapped in CalibratedClassifierCV
+    # (for calibrated predict_proba -- see get_model_defs), so
+    # shap.TreeExplainer no longer applies to it (it only supports
+    # raw tree estimators, not the calibration wrapper). Always use
+    # the generic black-box explainer via predict_proba instead --
+    # it works for any model type (SVM, RandomForest, LogisticRegression,
+    # wrapped or not), just slower than TreeExplainer would have been.
     try:
-        if best_model_name == "RandomForest":
-            explainer = shap.TreeExplainer(best_model)
-            shap_values = explainer.shap_values(X_test_final)
+        explainer = shap.Explainer(
+            best_model.predict_proba,
+            X_train_final
+        )
 
-            plt.figure(figsize=(10, 6))
-            shap.summary_plot(
-                shap_values[1],
-                X_test_final,
-                show=False
-            )
-            st.pyplot(plt.gcf())
-            plt.clf()
+        shap_values = explainer(X_test_final)
 
-        else:
-            explainer = shap.Explainer(
-                best_model.predict_proba,
-                X_train_final
-            )
-
-            shap_values = explainer(X_test_final)
-
-            plt.figure(figsize=(10, 6))
-            shap.summary_plot(
-                shap_values[:, :, 1],
-                X_test_final,
-                show=False
-            )
-            st.pyplot(plt.gcf())
-            plt.clf()
+        plt.figure(figsize=(10, 6))
+        shap.summary_plot(
+            shap_values[:, :, 1],
+            X_test_final,
+            show=False
+        )
+        st.pyplot(plt.gcf())
+        plt.clf()
 
     except Exception as e:
         st.error(f"SHAP Error: {e}")
@@ -1155,18 +1291,27 @@ if run:
     # (Reviewer 2, point 5: visualize before/after ComBat)
     st.subheader("🧫 Batch Effect: Before vs After ComBat")
 
+    # CHANGED: now shows all THREE batches (train batch1/batch2
+    # + external batch3), since ComBat is now fit across all
+    # three datasets together -- this plot is the direct visual
+    # check for whether GSE32225 actually mixes in with train
+    # after correction, instead of only showing the two train
+    # batches like before.
     viz_imputer = SimpleImputer(strategy="median")
 
+    X_all_pre_viz = pd.concat([X_train_pre_combat, X3_pre_combat])
+    X_all_post_viz = pd.concat([X_train, X_test])
+
     X_pre_viz = pd.DataFrame(
-        viz_imputer.fit_transform(X_train_pre_combat),
-        columns=X_train_pre_combat.columns,
-        index=X_train_pre_combat.index
+        viz_imputer.fit_transform(X_all_pre_viz),
+        columns=X_all_pre_viz.columns,
+        index=X_all_pre_viz.index
     )
 
     X_post_viz = pd.DataFrame(
-        viz_imputer.fit_transform(X_train),
-        columns=X_train.columns,
-        index=X_train.index
+        viz_imputer.fit_transform(X_all_post_viz),
+        columns=X_all_post_viz.columns,
+        index=X_all_post_viz.index
     )
 
     pca_pre = PCA(n_components=2).fit_transform(X_pre_viz)

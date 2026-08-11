@@ -5,9 +5,14 @@ import gzip
 import os
 import shap
 
-from sklearn.model_selection import cross_val_score, StratifiedKFold
+from sklearn.model_selection import (
+    cross_val_score,
+    cross_val_predict,
+    StratifiedKFold
+)
 from sklearn.base import clone
-from sklearn.impute import KNNImputer
+from sklearn.calibration import CalibratedClassifierCV
+from sklearn.impute import KNNImputer, SimpleImputer
 from sklearn.preprocessing import StandardScaler
 from sklearn.linear_model import LogisticRegression, LogisticRegressionCV
 from sklearn.svm import SVC
@@ -17,7 +22,8 @@ from sklearn.decomposition import PCA
 from sklearn.metrics import (
     confusion_matrix,
     roc_curve,
-    roc_auc_score
+    roc_auc_score,
+    f1_score
 )
 
 from scipy import stats
@@ -73,24 +79,81 @@ def extract_labels(lines, sample_ids):
     for sid, title in zip(sample_ids, sample_titles):
         t = title.lower().strip()
 
+        # -------------------------------------------------
+        # FIX (data label bug found post-review):
+        # GSE76297 mixes two DIFFERENT diseases under near-
+        # identical naming: "HCC Tumor/Non-Tumor Tissue ..."
+        # (hepatocellular carcinoma) and "CCA Tumor/Non-Tumor
+        # Tissue ..." (cholangiocarcinoma, the disease this
+        # study is about). HCC samples must be dropped
+        # entirely -- they are not CCA and not normal bile
+        # duct tissue, so they cannot be used as either class.
+        # -------------------------------------------------
+        if t.startswith("hcc"):
+            labels[sid] = -1
+            continue
+
+        if t.startswith("cca") and (
+            "non-tumor" in t or "non tumor" in t or "nontumor" in t
+        ):
+            labels[sid] = 0
+            continue
+
+        if t.startswith("cca") and "tumor" in t:
+            labels[sid] = 1
+            continue
+
+        # GSE132305 naming: "..._BD" = non-tumor bile duct
+        # (normal), "..._eCCA" = extrahepatic CCA (tumor)
         if t.endswith("_bd"):
             labels[sid] = 0
-        elif t.endswith("_ecca"):
+            continue
+
+        if t.endswith("_ecca"):
             labels[sid] = 1
-        elif t.startswith("ctrl"):
+            continue
+
+        # GSE32225 naming: "Ctrl_..." = normal control;
+        # "CCBCN.../CCM.../CCNY..." = tumor cohorts
+        # (Barcelona / Milan / New York)
+        if t.startswith("ctrl"):
             labels[sid] = 0
-        elif (
+            continue
+
+        if (
             t.startswith("ccbcn")
             or t.startswith("ccm")
             or t.startswith("ccny")
         ):
             labels[sid] = 1
-        elif any(k in t for k in ["normal", "control", "benign"]):
+            continue
+
+        # -------------------------------------------------
+        # FIX: generic fallback keyword matching -- negative-
+        # form phrases ("non-tumor", "non-cancerous") are
+        # checked BEFORE the generic "tumor"/"cancer"
+        # substring check below, since e.g. "non-tumor"
+        # literally contains the substring "tumor" and would
+        # otherwise be misclassified as the positive class.
+        # This branch should rarely fire given the explicit
+        # per-dataset rules above; kept as a safety net for
+        # any other naming pattern.
+        # -------------------------------------------------
+        if any(
+            k in t for k in [
+                "non-tumor", "non tumor", "nontumor", "non_tumor",
+                "non-cancerous", "noncancerous",
+                "normal", "control", "benign"
+            ]
+        ):
             labels[sid] = 0
-        elif any(k in t for k in ["tumor", "cca", "cancer"]):
+            continue
+
+        if any(k in t for k in ["tumor", "cca", "cancer"]):
             labels[sid] = 1
-        else:
-            labels[sid] = -1
+            continue
+
+        labels[sid] = -1
 
     return labels
 
@@ -413,25 +476,45 @@ def bootstrap_auc_ci(
 
 
 # =====================================================
-# TRAIN MODELS
+# MODEL DEFINITIONS (factored out so folds/ablation get
+# fresh, identically-configured estimators)
 # =====================================================
-def train_models(
-    X_train,
-    y_train,
-    X_test,
-    y_test
-):
-    models = {
-        "SVM": SVC(
-            kernel="linear",
-            C=0.1,
-            probability=True,
-            class_weight="balanced"
+def get_model_defs():
+    return {
+        # FIX: SVM and RandomForest predicted probabilities were
+        # extremely uncalibrated (near-0/near-1 or constant-across-
+        # samples) on the external set, causing both to collapse to a
+        # single predicted class (AUC=0.5). Wrapped in
+        # CalibratedClassifierCV (Platt/sigmoid, 5-fold internal CV)
+        # so predict_proba reflects genuine confidence instead of raw
+        # decision-function extremes. probability=True removed from
+        # SVC to avoid double-calibrating (SVC's own internal Platt
+        # scaling stacked under CalibratedClassifierCV's).
+        "SVM": CalibratedClassifierCV(
+            SVC(
+                kernel="linear",
+                C=0.1,
+                class_weight="balanced"
+            ),
+            method="sigmoid",
+            cv=5
         ),
-        "RandomForest": RandomForestClassifier(
-            n_estimators=1000,
-            max_depth=10,
-            random_state=42
+        # FIX: class_weight="balanced" was missing here even though
+        # the paper's Methodology section explicitly states "balanced
+        # class weights were applied during training to mitigate the
+        # impact of class imbalance" -- this contradicted the actual
+        # code. Training set is ~68% CCA / 32% normal after the label
+        # fix, so this matters. Also wrapped in CalibratedClassifierCV
+        # for the same reason as SVM above.
+        "RandomForest": CalibratedClassifierCV(
+            RandomForestClassifier(
+                n_estimators=1000,
+                max_depth=10,
+                random_state=42,
+                class_weight="balanced"
+            ),
+            method="sigmoid",
+            cv=5
         ),
         "LogisticRegression": LogisticRegression(
             class_weight="balanced",
@@ -439,16 +522,39 @@ def train_models(
         )
     }
 
+
+# =====================================================
+# TRAIN MODELS  (fits the final model on ALL training
+# data, evaluates once on the untouched external set)
+#
+# FIX (Reviewer 1): the decision threshold used to be
+# picked with Youden's J computed on (y_test, y_prob) --
+# i.e. it was tuned using the external validation labels.
+# That is a data-leakage bug: it inflates every reported
+# external metric (Accuracy/Recall/F1/Specificity/MCC).
+# The threshold is now chosen from OUT-OF-FOLD predicted
+# probabilities on the TRAINING set only (via
+# cross_val_predict), so the external set is never looked
+# at until the very last, single evaluation step.
+# =====================================================
+def train_models(
+    X_train,
+    y_train,
+    X_test,
+    y_test,
+    cv
+):
     results = {}
 
-    cv = StratifiedKFold(
-        n_splits=5,
-        shuffle=True,
-        random_state=42
-    )
+    for name, model in get_model_defs().items():
 
-    for name, model in models.items():
-
+        # Naive (non-nested) CV score -- feature selection
+        # (DEA/mRMR/LASSO) was already fit on the full
+        # X_train before this function runs, so folds here
+        # still "see" information from held-out samples via
+        # gene selection. Kept ONLY so it can be shown next
+        # to the honest nested-CV score below, to make the
+        # gap Reviewer 1 flagged explicit rather than hidden.
         cv_scores = cross_val_score(
             clone(model),
             X_train,
@@ -457,22 +563,24 @@ def train_models(
             scoring="f1"
         )
 
+        # Out-of-fold probabilities on TRAINING data only,
+        # used solely to pick the Youden threshold. y_test
+        # is never touched here.
+        oof_probs = cross_val_predict(
+            clone(model),
+            X_train,
+            y_train,
+            cv=cv,
+            method="predict_proba"
+        )[:, 1]
+
+        fpr_tr, tpr_tr, thr_tr = roc_curve(y_train, oof_probs)
+        threshold = thr_tr[np.argmax(tpr_tr - fpr_tr)]
+
         model.fit(X_train, y_train)
 
         y_prob = model.predict_proba(X_test)[:, 1]
-
-        fpr, tpr, thresholds = roc_curve(
-            y_test,
-            y_prob
-        )
-
-        threshold = thresholds[
-            np.argmax(tpr - fpr)
-        ]
-
-        y_pred = (
-            y_prob >= threshold
-        ).astype(int)
+        y_pred = (y_prob >= threshold).astype(int)
 
         metrics = calculate_metrics(
             y_test,
@@ -489,6 +597,13 @@ def train_models(
             "model": model,
             "y_pred": y_pred,
             "y_prob": y_prob,
+            # ADDED: full training out-of-fold probabilities (not just
+            # the external-test y_prob above). Lets us compare the
+            # train-time probability distribution against the external
+            # one directly -- e.g. to check for the kind of extreme
+            # near-0/near-1 collapse seen in the false-negative table.
+            "train_oof_prob": oof_probs,
+            "threshold": threshold,
             "CV_F1_Mean": cv_scores.mean(),
             "CV_F1_STD": cv_scores.std(),
             "AUC_CI_Lower": auc_lower,
@@ -497,6 +612,75 @@ def train_models(
         }
 
     return results
+
+
+# =====================================================
+# NESTED CV / ABLATION EVALUATION
+#
+# FIX (Reviewer 1 & 2): DEA / mRMR / LASSO were previously
+# fit ONCE on the entire training set, and cross-validation
+# only ran on the already-selected genes. That lets every
+# CV fold benefit from gene-selection decisions that used
+# its own held-out samples -- which is why CV F1 sat near
+# 0.99 while external F1 was 0.86. Here, feature selection
+# is repeated INSIDE every fold, using only that fold's
+# training split, so the reported score is an honest
+# estimate of generalization. This function is also reused
+# for the ablation study (Reviewer 2, point 1): pass a
+# subset of stages to see each stage's contribution.
+# =====================================================
+def nested_cv_pipeline_eval(
+    X,
+    y,
+    stages,
+    logfc_thresh,
+    pval_thresh,
+    mrmr_k,
+    cv
+):
+    model_names = list(get_model_defs().keys())
+    fold_scores = {m: [] for m in model_names}
+    n_features_per_fold = []
+
+    for train_idx, val_idx in cv.split(X, y):
+        X_tr, X_val = X.iloc[train_idx], X.iloc[val_idx]
+        y_tr, y_val = y.iloc[train_idx], y.iloc[val_idx]
+
+        feats = X_tr.columns.tolist()
+
+        if "dea" in stages:
+            feats, _ = differential_expression(
+                X_tr[feats], y_tr, logfc_thresh, pval_thresh
+            )
+
+        if "mrmr" in stages:
+            feats = mrmr_selection(X_tr[feats], y_tr, mrmr_k)
+
+        if "lasso" in stages:
+            feats = lasso_selection(X_tr[feats], y_tr)
+
+        if len(feats) == 0:
+            feats = X_tr.columns[:10].tolist()
+
+        n_features_per_fold.append(len(feats))
+
+        X_tr_f, X_val_f = X_tr[feats], X_val[feats]
+
+        for name, model in get_model_defs().items():
+            model.fit(X_tr_f, y_tr)
+            pred = model.predict(X_val_f)
+            fold_scores[name].append(
+                f1_score(y_val, pred, zero_division=0)
+            )
+
+    return fold_scores, n_features_per_fold
+
+
+STAGE_LABELS = {
+    ("dea",): "DEA only",
+    ("dea", "mrmr"): "DEA + mRMR",
+    ("dea", "mrmr", "lasso"): "DEA + mRMR + LASSO (Full)"
+}
 
 
 # =====================================================
@@ -557,6 +741,20 @@ mrmr_k = st.sidebar.slider(
     50
 )
 
+st.sidebar.markdown("---")
+
+run_nested_cv = st.sidebar.checkbox(
+    "Run honest nested CV + ablation study",
+    value=True,
+    help=(
+        "Repeats DEA/mRMR/LASSO feature selection inside "
+        "every CV fold instead of once before CV. This is "
+        "slower (re-runs mRMR/LASSO several times) but gives "
+        "an unbiased CV estimate and an ablation breakdown "
+        "per pipeline stage, as requested by Reviewer 2."
+    )
+)
+
 run = st.sidebar.button("Run Pipeline")
 
 
@@ -593,6 +791,35 @@ if run:
         "GPL8432"
     )
 
+    # =====================================================
+    # DATASET SUMMARY (Reviewer 1 & 2: dataset description
+    # was insufficient -- report sample counts, class
+    # balance, and gene counts at every stage)
+    # =====================================================
+    dataset_summary_rows = [
+        {
+            "Dataset": "GSE76297 (train)",
+            "N samples": len(y1),
+            "N CCA": int((y1 == 1).sum()),
+            "N normal": int((y1 == 0).sum()),
+            "N genes (after probe->gene mapping)": expr1.shape[1]
+        },
+        {
+            "Dataset": "GSE132305 (train)",
+            "N samples": len(y2),
+            "N CCA": int((y2 == 1).sum()),
+            "N normal": int((y2 == 0).sum()),
+            "N genes (after probe->gene mapping)": expr2.shape[1]
+        },
+        {
+            "Dataset": "GSE32225 (external validation)",
+            "N samples": len(y3),
+            "N CCA": int((y3 == 1).sum()),
+            "N normal": int((y3 == 0).sum()),
+            "N genes (after probe->gene mapping)": expr3.shape[1]
+        }
+    ]
+
     expr1 = convert_probe_to_gene(expr1, map1)
     expr2 = convert_probe_to_gene(expr2, map2)
     expr3 = convert_probe_to_gene(expr3, map3)
@@ -613,11 +840,17 @@ if run:
     X_test = expr3[common_genes]
     y_test = y3
 
+    n_missing_train = int(X_train.isna().sum().sum())
+    n_missing_test = int(X_test.isna().sum().sum())
+
     batch_labels = (
         ["batch1"] * len(expr1)
         +
         ["batch2"] * len(expr2)
     )
+
+    # Kept for the before/after ComBat visualization below.
+    X_train_pre_combat = X_train.copy()
 
     X_train = pycombat(
         X_train.T,
@@ -683,11 +916,23 @@ if run:
     X_train_final = X_train[final_features]
     X_test_final = X_test[final_features]
 
+    # Single cv object reused everywhere below so that the
+    # naive CV, the nested CV, and the ablation study all
+    # split the SAME folds (same random_state/shuffle over
+    # the same y_train) -- this is what makes the paired
+    # significance test between models valid.
+    cv = StratifiedKFold(
+        n_splits=5,
+        shuffle=True,
+        random_state=42
+    )
+
     results = train_models(
         X_train_final,
         y_train,
         X_test_final,
-        y_test
+        y_test,
+        cv
     )
 
     metrics_df = pd.DataFrame(results).T.drop(
@@ -709,6 +954,121 @@ if run:
         st.write(
             f"{model_name}: "
             f"{result['AUC_CI_Lower']:.4f} - {result['AUC_CI_Upper']:.4f}"
+        )
+
+    # =====================================================
+    # HONEST NESTED CV + ABLATION STUDY
+    # (Reviewer 1: explain the CV vs external-validation gap
+    #  Reviewer 2, point 1: ablation study per pipeline stage)
+    # =====================================================
+    ablation_fold_scores = {}
+
+    if run_nested_cv:
+        st.markdown("---")
+        st.header("🔎 Honest Nested CV & Ablation Study")
+        st.caption(
+            "Feature selection (DEA/mRMR/LASSO) is repeated "
+            "inside every fold here, using only that fold's "
+            "training split -- unlike the naive CV above, "
+            "where genes were selected once on the full "
+            "training set before splitting into folds."
+        )
+
+        stage_progress = st.progress(0.0, text="Running nested CV...")
+        stage_configs = list(STAGE_LABELS.keys())
+
+        for i, stages in enumerate(stage_configs):
+            fold_scores, n_feats = nested_cv_pipeline_eval(
+                X_train,
+                y_train,
+                stages,
+                logfc_thresh,
+                pval_thresh,
+                mrmr_k,
+                cv
+            )
+            ablation_fold_scores[stages] = {
+                "fold_scores": fold_scores,
+                "n_features": n_feats
+            }
+            stage_progress.progress(
+                (i + 1) / len(stage_configs),
+                text=f"Completed: {STAGE_LABELS[stages]}"
+            )
+
+        stage_progress.empty()
+
+        # --- CV vs honest nested CV vs external F1, side by side ---
+        full_stage = ("dea", "mrmr", "lasso")
+        gap_rows = []
+        for model_name in get_model_defs().keys():
+            naive_cv = results[model_name]["CV_F1_Mean"]
+            nested = np.mean(
+                ablation_fold_scores[full_stage]["fold_scores"][model_name]
+            )
+            external = results[model_name]["F1"]
+            gap_rows.append({
+                "Model": model_name,
+                "Naive CV F1 (pre-selected genes)": naive_cv,
+                "Honest nested CV F1 (re-selected per fold)": nested,
+                "External validation F1": external
+            })
+
+        st.subheader("📉 CV vs External Validation Gap")
+        st.dataframe(pd.DataFrame(gap_rows).set_index("Model"))
+        st.caption(
+            "The naive CV column reproduces the inflated ~0.99 "
+            "scores seen in the original submission. The nested "
+            "column is the honest estimate and should sit much "
+            "closer to the external validation column."
+        )
+
+        # --- Ablation table ---
+        st.subheader("🧪 Ablation Study: Contribution of Each Stage")
+        ablation_rows = []
+        for stages in stage_configs:
+            row = {"Pipeline stage": STAGE_LABELS[stages]}
+            row["Avg. genes selected"] = np.mean(
+                ablation_fold_scores[stages]["n_features"]
+            )
+            for model_name in get_model_defs().keys():
+                scores = ablation_fold_scores[stages]["fold_scores"][model_name]
+                row[f"{model_name} F1 (mean ± std)"] = (
+                    f"{np.mean(scores):.4f} ± {np.std(scores):.4f}"
+                )
+            ablation_rows.append(row)
+
+        st.dataframe(pd.DataFrame(ablation_rows).set_index("Pipeline stage"))
+
+        # --- Statistical significance test ---
+        st.subheader("📐 Statistical Significance (paired, nested-CV folds)")
+        lr_scores = np.array(
+            ablation_fold_scores[full_stage]["fold_scores"]["LogisticRegression"]
+        )
+        sig_rows = []
+        for model_name in ["SVM", "RandomForest"]:
+            other_scores = np.array(
+                ablation_fold_scores[full_stage]["fold_scores"][model_name]
+            )
+            t_stat, p_val = stats.ttest_rel(lr_scores, other_scores)
+            sig_rows.append({
+                "Comparison": f"LogisticRegression vs {model_name}",
+                "Mean F1 diff": lr_scores.mean() - other_scores.mean(),
+                "Paired t-statistic": t_stat,
+                "p-value": p_val,
+                "Significant (p<0.05)": "Yes" if p_val < 0.05 else "No"
+            })
+        st.dataframe(pd.DataFrame(sig_rows).set_index("Comparison"))
+        st.caption(
+            "Paired t-test across the 5 nested-CV folds (same "
+            "folds for every model). With only 5 folds this test "
+            "has low power -- treat the p-value as indicative, "
+            "not definitive, and report it in the paper as such."
+        )
+    else:
+        st.info(
+            "Honest nested CV + ablation study was skipped "
+            "(disabled in the sidebar)."
         )
 
     best_model_name = max(
@@ -757,8 +1117,87 @@ if run:
     st.subheader("Selected Genes")
     st.write(final_features)
 
+    # =====================================================
+    # FALSE NEGATIVE ANALYSIS
+    # (Reviewer 1: missed CCA cases are clinically serious --
+    # analyse them more seriously instead of a passing mention)
+    # =====================================================
+    st.markdown("---")
+    st.header("⚠️ False Negative Analysis (missed CCA cases)")
+
+    for model_name, res in results.items():
+        fn_mask = (y_test.values == 1) & (res["y_pred"] == 0)
+        n_fn = int(fn_mask.sum())
+        n_cca = int((y_test.values == 1).sum())
+
+        st.subheader(f"{model_name}: {n_fn} / {n_cca} CCA samples missed")
+
+        if n_fn > 0:
+            fn_df = pd.DataFrame({
+                "Sample ID": y_test.index[fn_mask],
+                "Predicted P(CCA)": res["y_prob"][fn_mask],
+                "Decision threshold used": res["threshold"]
+            }).sort_values("Predicted P(CCA)", ascending=False)
+
+            st.dataframe(fn_df.set_index("Sample ID"))
+            st.caption(
+                "Samples with predicted probability close to the "
+                "threshold are borderline misses; samples with a "
+                "low probability are confidently missed and worth "
+                "flagging as biologically atypical CCA cases in "
+                "the paper's Discussion."
+            )
+
     st.markdown("---")
     st.header("📊 Additional Analytics Dashboard")
+
+    # --- ComBat before/after batch-effect visualization ---
+    # (Reviewer 2, point 5: visualize before/after ComBat)
+    st.subheader("🧫 Batch Effect: Before vs After ComBat")
+
+    viz_imputer = SimpleImputer(strategy="median")
+
+    X_pre_viz = pd.DataFrame(
+        viz_imputer.fit_transform(X_train_pre_combat),
+        columns=X_train_pre_combat.columns,
+        index=X_train_pre_combat.index
+    )
+
+    X_post_viz = pd.DataFrame(
+        viz_imputer.fit_transform(X_train),
+        columns=X_train.columns,
+        index=X_train.index
+    )
+
+    pca_pre = PCA(n_components=2).fit_transform(X_pre_viz)
+    pca_post = PCA(n_components=2).fit_transform(X_post_viz)
+
+    batch_arr = np.array(batch_labels)
+    fig, axes = plt.subplots(1, 2, figsize=(12, 5))
+
+    for batch in sorted(set(batch_labels)):
+        mask = batch_arr == batch
+        axes[0].scatter(
+            pca_pre[mask, 0], pca_pre[mask, 1], label=batch, alpha=0.7
+        )
+        axes[1].scatter(
+            pca_post[mask, 0], pca_post[mask, 1], label=batch, alpha=0.7
+        )
+
+    axes[0].set_title("Before ComBat")
+    axes[1].set_title("After ComBat")
+    for ax in axes:
+        ax.set_xlabel("PC1")
+        ax.set_ylabel("PC2")
+        ax.legend()
+
+    st.pyplot(fig)
+    st.caption(
+        "Values are median-imputed here purely for this plot "
+        "(separate from the pipeline's KNN imputer) so PCA can "
+        "run. If ComBat worked, the two batches should mix "
+        "together more after correction than before."
+    )
 
     st.subheader("📌 Model Performance Heatmap")
 
@@ -857,8 +1296,23 @@ if run:
 
     st.subheader("📌 Dataset Summary")
 
+    st.markdown("**Per-dataset sample and gene counts** (Reviewer 1 & 2)")
+    st.dataframe(
+        pd.DataFrame(dataset_summary_rows).set_index("Dataset")
+    )
+
+    st.markdown("**Gene counts through the feature-selection pipeline**")
+    st.dataframe(pd.DataFrame([{
+        "Common genes across all 3 datasets": len(common_genes),
+        "Missing values imputed (train)": n_missing_train,
+        "Missing values imputed (external test)": n_missing_test,
+        "Genes after DEA": len(dea_genes),
+        "Genes after mRMR": len(mrmr_genes),
+        "Genes after LASSO (final)": len(final_features)
+    }]).T.rename(columns={0: "Count"}))
+
     st.write("Train shape:", X_train_final.shape)
     st.write("Test shape:", X_test_final.shape)
     st.write("Number of selected genes:", len(final_features))
-    st.write("Class distribution:")
+    st.write("Class distribution (train):")
     st.write(y_train.value_counts())
