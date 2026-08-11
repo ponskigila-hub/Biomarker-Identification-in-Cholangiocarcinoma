@@ -8,4 +8,4 @@ matplotlib
 seaborn
 shap
 mrmr-selection
-pycombat
+combat
