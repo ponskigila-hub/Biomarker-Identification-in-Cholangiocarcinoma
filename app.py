@@ -902,25 +902,23 @@ if run:
     n_missing_test = int(X_test.isna().sum().sum())
 
     # =====================================================
-    # CHANGED (threshold-transfer investigation, 2026-08-11):
-    # ComBat used to be fit ONLY on X_train (batch1/batch2),
-    # leaving GSE32225 (external, a third platform) with no
-    # batch-effect correction at all. After the log2 fix,
-    # magnitudes became comparable across datasets, but a
-    # systematic per-gene OFFSET between GSE32225 and the
-    # ComBat-corrected train set remained -- external
-    # predict_proba saturated near 0 for every sample
-    # (CCA and normal alike) even though AUC stayed high
-    # (ranking was fine, the whole cohort was just shifted).
-    #
-    # Fix: run ComBat across all THREE datasets together as
-    # three batches, BEFORE the train/test split is used for
-    # anything supervised. This is still leakage-free: ComBat
-    # only uses batch identity + expression values, never the
-    # class label y. Downstream steps that must stay
-    # train-only (DEA/mRMR/LASSO feature selection, Youden/
-    # sensitivity threshold selection) are unaffected -- they
-    # still only ever see X_train after this point.
+    # REVERTED BACK (2026-08-11, after user confirmed
+    # regression): fitting ComBat on train-only (batch1+batch2)
+    # while leaving external (batch3/GSE32225) uncorrected
+    # caused exactly the failure mode warned about above --
+    # confirmed by the "149/149 CCA samples missed" result
+    # across all three models (Specificity=1, Recall=0
+    # everywhere) and the before/after ComBat PCA plot showing
+    # batch3 sitting completely apart from train even "after"
+    # correction. Restoring the fix: run ComBat across all
+    # THREE datasets together as three batches, BEFORE the
+    # train/test split is used for anything supervised. This
+    # is still leakage-free: ComBat only uses batch identity +
+    # expression values, never the class label y. Downstream
+    # steps that must stay train-only (DEA/mRMR/LASSO feature
+    # selection, Youden/sensitivity threshold selection) are
+    # unaffected -- they still only ever see X_train after
+    # this point.
     # =====================================================
     batch_labels = (
         ["batch1"] * len(expr1)
@@ -1201,6 +1199,21 @@ if run:
                 "p-value": p_val,
                 "Significant (p<0.05)": "Yes" if p_val < 0.05 else "No"
             })
+
+        svm_scores = np.array(
+            ablation_fold_scores[full_stage]["fold_scores"]["SVM"]
+        )
+        rf_scores = np.array(
+            ablation_fold_scores[full_stage]["fold_scores"]["RandomForest"]
+        )
+        t_stat_svm_rf, p_val_svm_rf = stats.ttest_rel(svm_scores, rf_scores)
+        sig_rows.append({
+            "Comparison": "SVM vs RandomForest",
+            "Mean F1 diff": svm_scores.mean() - rf_scores.mean(),
+            "Paired t-statistic": t_stat_svm_rf,
+            "p-value": p_val_svm_rf,
+            "Significant (p<0.05)": "Yes" if p_val_svm_rf < 0.05 else "No"
+        })
         st.dataframe(pd.DataFrame(sig_rows).set_index("Comparison"))
         st.caption(
             "Paired t-test across the 5 nested-CV folds (same "
@@ -1291,12 +1304,13 @@ if run:
     # (Reviewer 2, point 5: visualize before/after ComBat)
     st.subheader("🧫 Batch Effect: Before vs After ComBat")
 
-    # CHANGED: now shows all THREE batches (train batch1/batch2
-    # + external batch3), since ComBat is now fit across all
-    # three datasets together -- this plot is the direct visual
-    # check for whether GSE32225 actually mixes in with train
-    # after correction, instead of only showing the two train
-    # batches like before.
+    # Shows all THREE batches (train batch1/batch2 + external
+    # batch3), since ComBat is fit across all three datasets
+    # together -- this plot is the direct visual check for
+    # whether GSE32225 actually mixes in with train after
+    # correction. If it doesn't mix (batch3 still forms its own
+    # cluster in "After ComBat"), expect the external-set
+    # predict_proba collapse seen in the resultv8 run.
     viz_imputer = SimpleImputer(strategy="median")
 
     X_all_pre_viz = pd.concat([X_train_pre_combat, X3_pre_combat])
